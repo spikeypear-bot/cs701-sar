@@ -34,6 +34,8 @@ def stratified_split(rows, holdout, seed):
         n_hold = round(len(group) * holdout)
         hold += group[:n_hold]
         train += group[n_hold:]
+    rng.shuffle(train)  # mixed classes in file order, so --limit N takes a sample of every class
+    rng.shuffle(hold)
     return train, hold
 
 

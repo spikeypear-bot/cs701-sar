@@ -20,7 +20,7 @@
 
 set -e
 module purge
-module load Anaconda3/2023.09-0
+module load Anaconda3/2024.06-1
 eval "$(conda shell.bash hook)"
 conda activate cs701bench
 

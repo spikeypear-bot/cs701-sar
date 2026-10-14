@@ -68,7 +68,7 @@ the protocol.
 
 ## What a run writes
 
-`runs/<backbone>_<init>_<adapt>/`:
+`runs/<name>_<time>/` (`--name`, default `<backbone>_<init>_<adapt>`; a new folder per run):
 
 - `log.txt`: training progress and the val and test scores.
 - `metrics.json`: arguments, parameter counts, `train_hours` (wall time of the epoch loop, including the
@@ -76,6 +76,10 @@ the protocol.
   in GiB; the process needs about 2.5 GiB more), every validation result, and the final val and test metrics.
 - `predictions_val.json`, `predictions_test.json`: detections in COCO result format, in original pixels.
 - `model.pt`: the final weights (`state_dict`).
+- `code.diff`: uncommitted changes to tracked files, if any; `metrics.json` has the git commit.
+
+Every run also adds a row to `runs/results.csv`: macro-F1, mAP, a rough Δm (the reference is scored on the
+official test split, a run on its own test split), parameter counts and training hours.
 
 ## Checks
 

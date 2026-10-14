@@ -1,8 +1,10 @@
 """Train one model jointly for classification and detection, then score it on val and test.
 Example: python train.py --backbone vit --init pretrained --adapt lora"""
 import argparse
+import csv
 import json
 import math
+import subprocess
 import time
 from pathlib import Path
 
@@ -15,6 +17,10 @@ from sarbench.backbones import build_backbone
 from sarbench.data import SARMultiTask, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import MultiTaskModel
+
+# Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
+MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
+REF_F1, REF_MAP = 0.9399, 0.2541
 
 
 def parse_args():
@@ -33,6 +39,7 @@ def parse_args():
     p.add_argument('--limit', type=int, help='use only the first N images of every split (quick checks)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--out', type=Path, default=Path('runs'))
+    p.add_argument('--name', help='run name; the run folder is <out>/<name>_<time> (default: backbone_init_adapt)')
     args = p.parse_args()
     if args.init == 'scratch' and args.adapt != 'full':
         p.error('--init scratch is only valid with --adapt full')
@@ -107,13 +114,43 @@ def headline(metrics):
     return ' '.join(f'{k} {metrics[k]:.4f}' for k in ('accuracy', 'macro_f1', 'balanced_accuracy', 'mAP', 'AP50'))
 
 
+def save_code_version(run_dir):
+    """The git commit, and uncommitted changes to tracked files as code.diff, so every run can be reproduced."""
+    git = lambda *cmd: subprocess.run(['git', *cmd], capture_output=True, text=True).stdout
+    diff = git('diff', 'HEAD')
+    if diff:
+        (run_dir / 'code.diff').write_text(diff)
+    return git('rev-parse', 'HEAD').strip() or None, bool(diff)
+
+
+def append_results(summary, path):
+    """One row per run in a table shared by all runs. Δm is rough here: the reference was scored on the
+    official test split, our numbers on the local holdout."""
+    final = summary['test']
+    row = {'run': summary['run'], 'commit': summary['commit'], 'dirty': summary['dirty'],
+           'macro_f1': round(final['macro_f1'], 4), 'mAP': round(final['mAP'], 4),
+           'dm_rough': round(100 * ((final['macro_f1'] - REF_F1) / REF_F1 + (final['mAP'] - REF_MAP) / REF_MAP) / 2, 2),
+           'parameters_M': round(summary['parameters'] / 1e6, 2),
+           'trainable_M': round(summary['trainable_parameters'] / 1e6, 2),
+           'train_hours': round(summary['train_hours'], 2)}
+    new = not path.exists()
+    with open(path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, list(row))
+        if new:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    run_dir = args.out / f'{args.backbone}_{args.init}_{args.adapt}'
-    run_dir.mkdir(parents=True, exist_ok=True)
+    name = args.name or f'{args.backbone}_{args.init}_{args.adapt}'
+    run_dir = args.out / f'{name}_{time.strftime("%Y%m%d-%H%M%S")}'  # a new folder per run: nothing is overwritten
+    run_dir.mkdir(parents=True)
     log_file = open(run_dir / 'log.txt', 'w')
     log(json.dumps(vars(args), default=str), log_file)
+    commit, dirty = save_code_version(run_dir)
+    log(f'code: commit {commit}' + (', with uncommitted changes (code.diff)' if dirty else ''), log_file)
 
     # Data
     train_loader, val_loader, test_loader = (make_loader(args, split) for split in ('train', 'val', 'test'))
@@ -126,6 +163,9 @@ def main():
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)
+    if parameters > MAX_PARAMETERS or trainable > MAX_TRAINABLE:
+        log(f'WARNING: over the limits ({MAX_PARAMETERS / 1e6:.0f} M total, {MAX_TRAINABLE / 1e6:.0f} M trainable); '
+            'not allowed for a submission', log_file)
 
     # Optimizer and schedule: trainable backbone parameters at --backbone-lr, all new modules at --lr
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -151,13 +191,15 @@ def main():
     log(f'test: {headline(test)}\ntraining {train_hours:.2f} h, peak GPU memory {peak_gb:.1f} GB', log_file)
 
     # Save
-    summary = {'args': vars(args), 'parameters': parameters, 'trainable_parameters': trainable,
+    summary = {'run': run_dir.name, 'commit': commit, 'dirty': dirty,
+               'args': vars(args), 'parameters': parameters, 'trainable_parameters': trainable,
                'train_hours': train_hours, 'peak_gpu_memory_gb': peak_gb,
                'val_history': history, 'val': history[-1], 'test': test}
     (run_dir / 'metrics.json').write_text(json.dumps(summary, indent=2, default=str))
     (run_dir / 'predictions_val.json').write_text(json.dumps(val_detections))
     (run_dir / 'predictions_test.json').write_text(json.dumps(test_detections))
     torch.save(model.state_dict(), run_dir / 'model.pt')
+    append_results(summary, args.out / 'results.csv')
 
 
 if __name__ == '__main__':

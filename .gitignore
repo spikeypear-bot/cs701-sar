@@ -1,3 +1,5 @@
 runs/
 __pycache__/
 .pytest_cache/
+cs701-sar-course-data/
+/data

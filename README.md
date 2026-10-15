@@ -145,6 +145,7 @@ Accuracy and AP50: [docs/DETAILS.md](docs/DETAILS.md#results-in-full).
 train.py              entry: train + evaluate one configuration
 run_all.sh            the eight reference runs (calls train.py)
 make_submission.py    write_submission(): predictions -> submission.zip
+predict.py            a trained run + images.json -> submission zip (scores it too, on the local holdout)
 sarbench/             the code behind train.py
 ├── data.py           images + boxes at 512 × 512, flips; boxes back to original pixels
 ├── backbones.py      ViT (ImageNet-21k), TerraMind-1.0-base

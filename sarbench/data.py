@@ -58,6 +58,35 @@ class SARMultiTask(Dataset):
         return image, int(row['label']), target
 
 
+class SARImages(Dataset):
+    """The images listed in a COCO-style images.json (course val and test: no labels), preprocessed as
+    SARMultiTask does without flips. An item is (image [1, size, size], its entry of images.json)."""
+
+    def __init__(self, images_json, root, size=512):
+        self.root = Path(root)  # the file names in images.json are relative to it
+        self.images = json.loads(Path(images_json).read_text())['images']
+        self.transform = v2.Compose([
+            v2.ToImage(),
+            v2.Resize((size, size)),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize([MEAN], [STD]),
+        ])
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, i):
+        info = self.images[i]
+        image = Image.open(self.root / info['file_name']).convert('L')
+        return self.transform(image), info
+
+
+def collate_images(batch):
+    """Stack the images of SARImages; their images.json entries stay a list."""
+    images, infos = zip(*batch)
+    return torch.stack(images), list(infos)
+
+
 def collate(batch):
     """Stack images and labels; targets stay a list because images have different numbers of boxes."""
     images, labels, targets = zip(*batch)

@@ -14,10 +14,10 @@ from torch.utils.data import DataLoader
 
 from make_submission import write_submission
 from sarbench.adapters import add_adapters
-from sarbench.backbones import build_backbone
+from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import SARImages, collate_images
 from sarbench.metrics import classification_metrics, detection_metrics
-from sarbench.model import MultiTaskModel
+from sarbench.model import MultiTaskModel, SwinMultiTaskModel
 from train import headline
 
 
@@ -42,7 +42,8 @@ def load_model(run):
     backbone = build_backbone(options['backbone'], pretrained=False)  # every weight comes from model.pt
     if options['adapt'] != 'full':
         add_adapters(backbone, options['adapt'])
-    model = MultiTaskModel(backbone, task_routing=options['adapt'] == 'moelora')
+    model_class = SwinMultiTaskModel if options['backbone'] in SWIN_MODELS else MultiTaskModel
+    model = model_class(backbone, task_routing=options['adapt'] == 'moelora')
     model.load_state_dict(torch.load(run / 'model.pt', map_location='cpu'))
     return model.cuda().eval()
 

@@ -13,10 +13,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from sarbench.adapters import add_adapters
-from sarbench.backbones import build_backbone
+from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import SARMultiTask, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
-from sarbench.model import MultiTaskModel
+from sarbench.model import MultiTaskModel, SwinMultiTaskModel
 
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
@@ -26,7 +26,7 @@ REF_F1, REF_MAP = 0.9399, 0.2541
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, default=Path(__file__).resolve().parents[1] / 'dataset' / 'SARFact-Course-20K')
-    p.add_argument('--backbone', required=True, choices=['vit', 'terramind'])
+    p.add_argument('--backbone', required=True, choices=['vit', 'terramind', *SWIN_MODELS])
     p.add_argument('--init', required=True, choices=['pretrained', 'scratch'])
     p.add_argument('--adapt', required=True, choices=['full', 'lora', 'moelora'])
     p.add_argument('--epochs', type=int, default=24)
@@ -159,7 +159,8 @@ def main():
     backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained')
     if args.adapt != 'full':
         add_adapters(backbone, args.adapt)  # also freezes the backbone
-    model = MultiTaskModel(backbone, task_routing=args.adapt == 'moelora').cuda()
+    model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
+    model = model_class(backbone, task_routing=args.adapt == 'moelora').cuda()
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)

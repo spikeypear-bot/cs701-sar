@@ -1,4 +1,5 @@
-"""The two ViT-B/16 backbones, built for 512 px input: images [B, 1, 512, 512] -> patch tokens [B, 1024, 768]."""
+"""The backbones, built for 512 px input. The two ViT-B/16: images [B, 1, 512, 512] -> patch tokens [B, 1024, 768].
+Swin: images [B, 1, 512, 512] -> 4 feature maps at strides 4, 8, 16 and 32."""
 import timm
 from terratorch.registry import BACKBONE_REGISTRY
 from torch import nn
@@ -41,6 +42,37 @@ class TerraMind(nn.Module):
         return per_block[-1]  # last block's tokens [B, N, 768]; terratorch already applied encoder_norm
 
 
+# --backbone name -> timm model (architecture.pretrained weights); timm.list_pretrained('swin*') lists the others
+SWIN_MODELS = {
+    'swin_t': 'swin_tiny_patch4_window7_224.ms_in22k_ft_in1k',
+    'swin_b': 'swin_base_patch4_window7_224.ms_in22k_ft_in1k',
+}
+
+
+class Swin(nn.Module):
+    """A timm Swin Transformer, its 4 stages as feature maps [B, C_i, 512 / s, 512 / s] for s = 4, 8, 16, 32.
+    Pretrained at 224 px, which is fine at 512: Swin's only position information is relative, inside each 7 x 7
+    window (the maps of 128, 64, 32 and 16 are padded to whole windows)."""
+
+    def __init__(self, pretrained: bool, name: str):
+        super().__init__()
+        self.swin = timm.create_model(name, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3),
+                                      img_size=512, in_chans=1)  # in_chans=1: timm sums the RGB patch-embedding weights
+        self.channels = self.swin.feature_info.channels()  # Swin-T [96, 192, 384, 768], Swin-B [128, ..., 1024]
+        self.embed_dim = self.channels[-1]  # the last map's channels, the input of the classification head
+
+    @property
+    def blocks(self):
+        """Every block of the 4 stages, for add_adapters (each has attn.qkv and attn.proj)."""
+        return [blk for i in range(4) for blk in self.swin[f'layers_{i}'].blocks]
+
+    def forward(self, x):
+        return [m.permute(0, 3, 1, 2) for m in self.swin(x)]  # timm gives [B, H, W, C]; the FPN takes [B, C, H, W]
+
+
 def build_backbone(name, pretrained):
-    """name: 'vit' or 'terramind'. pretrained=False builds the same architecture with random weights."""
+    """name: 'vit', 'terramind' or a key of SWIN_MODELS. pretrained=False builds the same architecture with random
+    weights."""
+    if name in SWIN_MODELS:
+        return Swin(pretrained, SWIN_MODELS[name])
     return {'vit': ViT, 'terramind': TerraMind}[name](pretrained)

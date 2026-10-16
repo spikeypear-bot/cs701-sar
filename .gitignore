@@ -4,3 +4,4 @@ __pycache__/
 cs701-sar-course-data/
 /data
 logs/
+.env

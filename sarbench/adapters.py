@@ -41,13 +41,16 @@ class MoELoRA(nn.Module):
         return self.base(x) + self.scale * self.up(self.down(x) * gates)
 
 
-def add_adapters(backbone, kind):
-    """Freeze the backbone, then wrap attn.qkv and attn.proj of every block (kind: 'lora' or 'moelora')."""
+def add_adapters(backbone, kind, rank=None):
+    """Freeze the backbone, then wrap attn.qkv and attn.proj of every block (kind: 'lora' or 'moelora').
+    rank: of each adapter (MoE-LoRA: of each expert); None keeps the defaults. alpha is 2 x rank, as in the defaults,
+    so alpha / r stays 2."""
     adapter = {'lora': LoRA, 'moelora': MoELoRA}[kind]
+    options = {} if rank is None else {'rank': rank, 'alpha': 2 * rank}
     backbone.requires_grad_(False)
     for blk in backbone.blocks:
-        blk.attn.qkv = adapter(blk.attn.qkv)
-        blk.attn.proj = adapter(blk.attn.proj)
+        blk.attn.qkv = adapter(blk.attn.qkv, **options)
+        blk.attn.proj = adapter(blk.attn.proj, **options)
 
 
 def set_task(module, task):

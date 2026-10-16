@@ -27,4 +27,6 @@ conda activate cs701bench
 cd "$SLURM_SUBMIT_DIR"              # the repo folder sbatch was run from
 nvidia-smi                          # which GPU this job got, at the top of the log
 
-srun python train.py --data data "$@"
+# The env's python by full path: when sbatch runs from a shell with cs701bench already active, `module load` puts
+# Anaconda's base python first on PATH and `conda activate` (seeing the env already active) does not fix it.
+srun "$CONDA_PREFIX/bin/python" train.py --data data "$@"

@@ -41,7 +41,7 @@ def load_model(run):
     options = json.loads((run / 'metrics.json').read_text())['args']
     backbone = build_backbone(options['backbone'], pretrained=False)  # every weight comes from model.pt
     if options['adapt'] != 'full':
-        add_adapters(backbone, options['adapt'])
+        add_adapters(backbone, options['adapt'], options.get('lora_rank'))  # runs before --lora-rank: the default
     model_class = SwinMultiTaskModel if options['backbone'] in SWIN_MODELS else MultiTaskModel
     model = model_class(backbone, task_routing=options['adapt'] == 'moelora')
     model.load_state_dict(torch.load(run / 'model.pt', map_location='cpu'))

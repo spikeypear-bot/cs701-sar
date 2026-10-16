@@ -29,6 +29,8 @@ def parse_args():
     p.add_argument('--backbone', required=True, choices=['vit', 'terramind', *SWIN_MODELS])
     p.add_argument('--init', required=True, choices=['pretrained', 'scratch'])
     p.add_argument('--adapt', required=True, choices=['full', 'lora', 'moelora'])
+    p.add_argument('--lora-rank', type=int, help='rank of each LoRA adapter (MoE-LoRA: of each expert), alpha = 2 x '
+                                                 'rank (default: 16, MoE-LoRA 4)')
     p.add_argument('--epochs', type=int, default=24)
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-4)
@@ -158,7 +160,7 @@ def main():
     # Model: adapters are created on the CPU, so they are added before .cuda()
     backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained')
     if args.adapt != 'full':
-        add_adapters(backbone, args.adapt)  # also freezes the backbone
+        add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
     model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
     model = model_class(backbone, task_routing=args.adapt == 'moelora').cuda()
     parameters = sum(p.numel() for p in model.parameters())

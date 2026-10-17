@@ -20,6 +20,11 @@ class ViT(nn.Module):
     def blocks(self):
         return self.vit.blocks
 
+    @property
+    def patch_embed(self):
+        """The input layer (16 x 16 patches -> 768 numbers), the only one that sees the input channels."""
+        return self.vit.patch_embed
+
     def forward(self, x):
         tokens = self.vit.forward_features(x)  # [B, 1 + N, 768], final norm applied
         return tokens[:, self.vit.num_prefix_tokens:]  # drop the CLS token
@@ -66,6 +71,11 @@ class Swin(nn.Module):
     def blocks(self):
         """Every block of the 4 stages, for add_adapters (each has attn.qkv and attn.proj)."""
         return [blk for i in range(4) for blk in self.swin[f'layers_{i}'].blocks]
+
+    @property
+    def patch_embed(self):
+        """The input layer (4 x 4 patches -> C numbers), the only one that sees the input channels."""
+        return self.swin['patch_embed']
 
     def forward(self, x):
         return [m.permute(0, 3, 1, 2) for m in self.swin(x)]  # timm gives [B, H, W, C]; the FPN takes [B, C, H, W]

@@ -38,6 +38,10 @@ def parse_args():
     p.add_argument('--input-channels', default='raw',
                    help=f'comma-separated input maps from {CHANNELS}, e.g. raw,nlm,cv (default: raw); see '
                         'sarbench/data.py input_channels')
+    p.add_argument('--train-patch-embed', action='store_true',
+                   help='with LoRA/MoE-LoRA, also train the input layer (frozen otherwise), so the model can learn '
+                        'how to mix --input-channels (Swin-B: 128 x channels x 16 + 384 parameters, its LayerNorm '
+                        'included)')
     p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
     p.add_argument('--boxpaste-prob', type=float, default=0.0,
                    help='chance that a training image gets same-class BoxPaste objects (default: 0 = off)')
@@ -63,6 +67,8 @@ def parse_args():
         p.error('--init scratch is only valid with --adapt full')
     if args.backbone_lr is None:
         args.backbone_lr = args.lr
+    if args.train_patch_embed and args.backbone == 'terramind':
+        p.error('--train-patch-embed is for the ViT and Swin backbones')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):
         p.error(f'--input-channels takes names from {CHANNELS}')
     return args
@@ -186,6 +192,8 @@ def main():
                               in_chans=len(args.input_channels.split(',')))
     if args.adapt != 'full':
         add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
+        if args.train_patch_embed:
+            backbone.patch_embed.requires_grad_(True)  # trained at --backbone-lr with the adapters
     model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
     model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
                         heatmap_min_sigma=args.heatmap_min_sigma).cuda()

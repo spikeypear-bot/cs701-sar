@@ -31,6 +31,10 @@ def parse_args():
     p.add_argument('--adapt', required=True, choices=['full', 'lora', 'moelora'])
     p.add_argument('--lora-rank', type=int, help='rank of each LoRA adapter (MoE-LoRA: of each expert), alpha = 2 x '
                                                  'rank (default: 16, MoE-LoRA 4)')
+    p.add_argument('--heatmap-weight', type=float, default=0.0,
+                   help='weight of the auxiliary object-centre heatmap loss, training only (default: 0 = no head)')
+    p.add_argument('--heatmap-min-sigma', type=float, default=2.0,
+                   help='smallest Gaussian sigma of the heatmap targets, in input pixels (default: 2)')
     p.add_argument('--epochs', type=int, default=24)
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-4)
@@ -71,8 +75,9 @@ def lr_factor(step, warmup, total):
     return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))  # --epochs 1: no decay phase
 
 
-def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file):
-    """One pass over the training set; the loss is cross-entropy plus the four Faster R-CNN losses."""
+def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, heatmap_weight=0.0):
+    """One pass over the training set; the loss is cross-entropy plus the four Faster R-CNN losses, plus
+    heatmap_weight x the heatmap loss with the heatmap head. The log shows each loss before weighting."""
     model.train()
     start, seen = time.time(), 0
     for step, (images, labels, targets) in enumerate(loader, 1):
@@ -80,7 +85,7 @@ def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file):
         with torch.autocast('cuda', dtype=torch.bfloat16):  # bf16 has fp32's range: no loss scaling needed
             logits, _, det_losses = model(images.cuda(), targets)
             losses = {'classification': F.cross_entropy(logits, labels.cuda()), **det_losses}
-        loss = sum(losses.values())
+        loss = sum(heatmap_weight * value if name == 'heatmap' else value for name, value in losses.items())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -162,7 +167,8 @@ def main():
     if args.adapt != 'full':
         add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
     model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
-    model = model_class(backbone, task_routing=args.adapt == 'moelora').cuda()
+    model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
+                        heatmap_min_sigma=args.heatmap_min_sigma).cuda()
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)
@@ -181,7 +187,7 @@ def main():
     # Train, validating every --eval-every epochs; the reported model is the last-epoch model
     history, start = [], time.time()
     for epoch in range(1, args.epochs + 1):
-        train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file)
+        train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file, args.heatmap_weight)
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val, val_detections = evaluate(model, val_loader, args.data / 'detection' / 'instances_val.json')
             history.append({'epoch': epoch, **val})

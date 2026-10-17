@@ -9,7 +9,7 @@ from sarbench.adapters import MoELoRA, add_adapters
 from sarbench.backbones import build_backbone
 from sarbench.data import SARMultiTask, collate, to_original_xywh
 from sarbench.metrics import detection_metrics
-from sarbench.model import MultiTaskModel
+from sarbench.model import MultiTaskModel, gaussian_heatmaps, heatmap_loss
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
 
@@ -60,6 +60,33 @@ def test_moelora_runs_the_backbone_once_per_task():
     with torch.no_grad():
         forward(model, first_train_images(2)[0])
     assert tasks == [0, 1]  # classification, then detection
+
+
+def test_heatmap_targets_peak_at_box_centres_and_keep_close_objects_apart():
+    # Two 8 px boxes centred on the stride-4 cells (row 10, col 20) and (row 12, col 20): 8 px apart, sigma 2 px
+    boxes = torch.tensor([[78., 38., 86., 46.], [78., 46., 86., 54.]])
+    heatmap, empty = gaussian_heatmaps([{'boxes': boxes}, {'boxes': torch.zeros(0, 4)}], 128, 4, min_sigma=2.0)
+    assert heatmap.shape == (128, 128) and heatmap.max() == 1
+    assert heatmap[10, 20] == 1 and heatmap[12, 20] == 1  # a peak at each centre
+    assert heatmap[11, 20] < 0.5  # max, not sum: the cell between them stays low
+    assert (empty == 0).all()
+
+
+def test_heatmap_loss_is_lower_for_the_target_than_for_an_empty_map():
+    target = gaussian_heatmaps([{'boxes': torch.tensor([[40., 40., 72., 72.]])}], 128, 4, min_sigma=2.0)
+    assert heatmap_loss(torch.logit(target.clamp(1e-4, 1 - 1e-4)), target) < heatmap_loss(target * 0 - 10, target)
+
+
+def test_heatmap_head_trains_only_and_predict_loads_without_it():
+    model = MultiTaskModel(build_backbone('vit', pretrained=False), task_routing=False, heatmap=True).cuda().train()
+    images, _, targets = first_train_images(2)
+    _, _, losses = forward(model, images, targets)
+    assert 'heatmap' in losses and losses['heatmap'].dtype == torch.float32 and losses['heatmap'].isfinite()
+    with torch.no_grad():
+        assert forward(model.eval(), images)[2] == {}  # the head is unused at inference
+    plain = MultiTaskModel(build_backbone('vit', pretrained=False), task_routing=False)
+    assert plain.heatmap_head is None
+    plain.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith('heatmap_head.')})
 
 
 def test_pretrained_vit_overfits_16_training_images():

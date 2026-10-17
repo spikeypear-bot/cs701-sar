@@ -101,3 +101,15 @@ def test_input_channels_keep_raw_and_mark_bright_points():
     assert maps.shape == (64, 64, 3) and maps.dtype == np.uint8
     assert (maps[..., 0] == gray).all()
     assert maps[31, 31, 2] > 50 and maps[5, 5, 2] == 0  # coefficient of variation: high at the point, 0 when flat
+
+
+def test_gre_marks_edges_but_not_speckle():
+    """Gradient by ratio: high at a step edge, about equal on dark and bright speckled ground (multiplicative noise)."""
+    rng = np.random.default_rng(0)
+    clean = np.full((64, 64), 40.0)
+    clean[:, 32:] = 160  # a step edge at column 32, 4 x brighter
+    speckled = np.clip(clean * rng.gamma(16, 1 / 16, clean.shape), 0, 255).astype(np.uint8)
+    gre = input_channels(speckled, ('gre',))[..., 0].astype(float)
+    edge, dark, bright = gre[10:54, 31:33].mean(), gre[10:54, 8:20].mean(), gre[10:54, 44:56].mean()
+    assert edge > 3 * max(dark, bright)
+    assert abs(dark - bright) < 0.5 * max(dark, bright)

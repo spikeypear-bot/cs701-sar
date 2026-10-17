@@ -18,7 +18,7 @@ from torchvision.transforms import v2
 # Mean and std of all pixels of the 9,392 train images, read as gray, resized to
 # 512 x 512 and scaled to [0, 1] (computed once).
 MEAN, STD = 0.2526, 0.2133
-CHANNELS = ('raw', 'nlm', 'cv')  # the choices of input_channels
+CHANNELS = ('raw', 'nlm', 'cv', 'gre')  # the choices of input_channels
 
 
 def _cv2():
@@ -28,12 +28,27 @@ def _cv2():
     return cv2
 
 
+def _gre_kernels(alpha=2.0, radius=6):
+    """1D kernels of 'gre': weights exp(-|d| / alpha) over the whole window, and over the side after the pixel and
+    the side before it (the centre excluded), each summing to 1. The 2D weights exp(-(|dx| + |dy|) / alpha) are
+    their outer product, so each half-window mean is two 1D passes. cv2.sepFilter2D correlates, so an entry right
+    of the kernel centre weighs the pixel right of (or below) the output pixel."""
+    d = np.arange(-radius, radius + 1)
+    whole = np.exp(-np.abs(d) / alpha).astype(np.float32)
+    after, before = whole * (d > 0), whole * (d < 0)
+    return whole / whole.sum(), after / after.sum(), before / before.sum()
+
+
 def input_channels(gray, channels):
     """gray: uint8 [H, W] -> uint8 [H, W, len(channels)], one map per name in channels:
     'raw': the image itself;
     'nlm': non-local means (Buades et al., 2005): speckle averaged over similar patches, edges kept (~80 ms);
     'cv': the local coefficient of variation (std / mean over 5 x 5, as the Lee filter measures it), high at bright
-    point targets and edges, low on flat ground; [0, 2] scaled to [0, 255]."""
+    point targets and edges, low on flat ground; [0, 2] scaled to [0, 255];
+    'gre': gradient by ratio (ROEWA, Fjortoft et al., 1998, as in SAR-SIFT and SARDet-100K's filter augmentation):
+    the magnitude of the log ratios of exponentially weighted means on opposite sides of each pixel, horizontally and
+    vertically. A ratio, not a difference, so speckle, which is multiplicative, does not raise it on bright ground;
+    [0, 2] scaled to [0, 255]."""
     maps = []
     for name in channels:
         if name == 'raw':
@@ -46,6 +61,12 @@ def input_channels(gray, channels):
             mean = cv2.blur(x, (5, 5))
             std = np.sqrt(np.maximum(cv2.blur(x * x, (5, 5)) - mean ** 2, 0))
             maps.append((np.clip(std / (mean + 1), 0, 2) * 127.5).astype(np.uint8))
+        elif name == 'gre':
+            cv2, x = _cv2(), gray.astype(np.float32) + 1  # + 1: no log of 0
+            whole, after, before = _gre_kernels()
+            gx = np.log(cv2.sepFilter2D(x, -1, after, whole) / cv2.sepFilter2D(x, -1, before, whole))  # right / left
+            gy = np.log(cv2.sepFilter2D(x, -1, whole, after) / cv2.sepFilter2D(x, -1, whole, before))  # below / above
+            maps.append((np.clip(np.hypot(gx, gy), 0, 2) * 127.5).astype(np.uint8))
         else:
             raise ValueError(f'unknown input channel {name!r}, expected one of {CHANNELS}')
     return np.stack(maps, axis=-1)

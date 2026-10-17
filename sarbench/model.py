@@ -13,6 +13,7 @@ from torchvision.ops import FeaturePyramidNetwork, MultiScaleRoIAlign
 from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
 
 from .adapters import set_task
+from .fgfm import ForegroundFPN, box_masks, foreground_loss
 
 
 class SimpleFeaturePyramid(nn.Module):
@@ -127,16 +128,35 @@ class MultiTaskModel(nn.Module):
 
 class SwinMultiTaskModel(MultiTaskModel):
     """MultiTaskModel on a Swin backbone: its 4 real maps (strides 4-32) go through an FPN instead of the ViTDet neck.
-    The classification head, anchors, RPN and RoI heads are MultiTaskModel's, unchanged."""
+    The classification head, anchors, RPN and RoI heads are MultiTaskModel's, unchanged. fgfm_levels (e.g. [0, 1, 2])
+    puts foreground-guided feature modulation on those FPN levels (sarbench/fgfm.py); it runs at inference too."""
 
-    def __init__(self, backbone, task_routing: bool, num_classes=9, **heatmap_options):
+    def __init__(self, backbone, task_routing: bool, num_classes=9, fgfm_levels=(), fgfm_alpha=0.8,
+                 **heatmap_options):
         # cls_head on backbone.embed_dim, anchors, rpn, roi_heads, heatmap_head
         super().__init__(backbone, task_routing, num_classes, **heatmap_options)
         # Replaces the ViTDet neck. LastLevelMaxPool adds the stride-64 'pool' level that the anchors expect.
-        self.neck = FeaturePyramidNetwork(backbone.channels, 256, extra_blocks=LastLevelMaxPool())
+        if fgfm_levels:
+            self.neck = ForegroundFPN(backbone.channels, 256, fgfm_levels, fgfm_alpha, extra_blocks=LastLevelMaxPool())
+        else:
+            self.neck = FeaturePyramidNetwork(backbone.channels, 256, extra_blocks=LastLevelMaxPool())
+
+    def foreground_losses(self, images, mask_logits, targets):
+        """{'foreground': mean over the FGFM levels of foreground_loss} when training with FGFM, else {}. Levels
+        without a single box cell in the batch are skipped, as in the original."""
+        if not (self.training and mask_logits):
+            return {}
+        losses = []
+        for logits in mask_logits.values():
+            stride = images.shape[-1] // logits.shape[-1]  # square inputs (data.py resizes to size x size)
+            target = box_masks(targets, logits.shape[-1], stride)
+            if target.any():
+                losses.append(foreground_loss(logits, target))
+        return {'foreground': torch.stack(losses).mean()} if losses else {}
 
     def forward(self, images, targets=None):
-        """As MultiTaskModel.forward, with 4 maps from the backbone instead of tokens."""
+        """As MultiTaskModel.forward, with 4 maps from the backbone instead of tokens, plus 'foreground' when
+        training with FGFM."""
         set_task(self.backbone, 0)
         maps = self.backbone(images)  # 4 maps [B, C_i, H_i, W_i]
         logits = self.cls_head(maps[-1].mean(dim=(2, 3)))  # global average of the last map -> [B, embed_dim]
@@ -144,11 +164,13 @@ class SwinMultiTaskModel(MultiTaskModel):
             set_task(self.backbone, 1)
             maps = self.backbone(images)
         features = self.neck(OrderedDict((str(i), m) for i, m in enumerate(maps)))  # '0'..'3' + 'pool', 256 channels
-        heatmap = self.heatmap_losses(images, features, targets)
+        features, mask_logits = features if isinstance(self.neck, ForegroundFPN) else (features, {})
+        auxiliary = {**self.heatmap_losses(images, features, targets),
+                     **self.foreground_losses(images, mask_logits, targets)}
         # From here on as in MultiTaskModel.forward: the detector in fp32 (see the precision rule there)
         with torch.autocast(images.device.type, enabled=False):
             features = {name: f.float() for name, f in features.items()}
             image_list = ImageList(images, [tuple(images.shape[-2:])] * len(images))
             proposals, rpn_losses = self.rpn(image_list, features, targets)
             detections, roi_losses = self.roi_heads(features, proposals, image_list.image_sizes, targets)
-        return logits, detections, {**rpn_losses, **roi_losses, **heatmap}
+        return logits, detections, {**rpn_losses, **roi_losses, **auxiliary}

@@ -44,6 +44,14 @@ def parse_args():
                    help='weight of the auxiliary object-centre heatmap loss, training only (default: 0 = no head)')
     p.add_argument('--heatmap-min-sigma', type=float, default=2.0,
                    help='smallest Gaussian sigma of the heatmap targets, in input pixels (default: 2)')
+    p.add_argument('--fgfm-levels', type=parse_blocks, default=[],
+                   help='Swin only: foreground-guided feature modulation (FGAA-FPN, Ma et al. 2026) on these FPN '
+                        'levels, e.g. 0-2 (0: stride 4, 1: 8, 2: 16, 3: 32; about 0.8 M parameters per level; '
+                        'default: off); see sarbench/fgfm.py')
+    p.add_argument('--fgfm-alpha', type=float, default=0.8,
+                   help='modulation strength: lateral map x (1 + alpha x weights) (default: 0.8, as FGAA-FPN)')
+    p.add_argument('--fgfm-loss-weight', type=float, default=0.7,
+                   help='weight of the foreground mask loss (default: 0.7, as FGAA-FPN)')
     p.add_argument('--input-channels', default='raw',
                    help=f'comma-separated input maps from {CHANNELS}, e.g. raw,nlm,cv (default: raw); see '
                         'sarbench/data.py input_channels')
@@ -86,6 +94,10 @@ def parse_args():
         p.error('--unfreeze-blocks is for LoRA and MoE-LoRA; --adapt full trains every block already')
     if args.train_patch_embed and args.backbone == 'terramind':
         p.error('--train-patch-embed is for the ViT and Swin backbones')
+    if args.fgfm_levels and args.backbone not in SWIN_MODELS:
+        p.error('--fgfm-levels is for the Swin backbones (an FPN over 4 backbone maps)')
+    if not set(args.fgfm_levels) <= {0, 1, 2, 3}:
+        p.error('--fgfm-levels takes levels 0 to 3')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):
         p.error(f'--input-channels takes names from {CHANNELS}')
     return args
@@ -115,9 +127,10 @@ def lr_factor(step, warmup, total):
     return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))  # --epochs 1: no decay phase
 
 
-def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, heatmap_weight=0.0):
-    """One pass over the training set; the loss is cross-entropy plus the four Faster R-CNN losses, plus
-    heatmap_weight x the heatmap loss with the heatmap head. The log shows each loss before weighting."""
+def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights):
+    """One pass over the training set; the loss is cross-entropy plus the four Faster R-CNN losses, plus the
+    auxiliary losses the model returns ('heatmap', 'foreground'), each times weights[name]. The log shows each loss
+    before weighting."""
     model.train()
     start, seen = time.time(), 0
     for step, (images, labels, targets) in enumerate(loader, 1):
@@ -125,7 +138,7 @@ def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, heatmap
         with torch.autocast('cuda', dtype=torch.bfloat16):  # bf16 has fp32's range: no loss scaling needed
             logits, _, det_losses = model(images.cuda(), targets)
             losses = {'classification': F.cross_entropy(logits, labels.cuda()), **det_losses}
-        loss = sum(heatmap_weight * value if name == 'heatmap' else value for name, value in losses.items())
+        loss = sum(weights.get(name, 1.0) * value for name, value in losses.items())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -214,8 +227,9 @@ def main():
             backbone.patch_embed.requires_grad_(True)  # trained at --backbone-lr with the adapters
         unfrozen = unfreeze_blocks(backbone, args.unfreeze_blocks)  # trained at --unfreeze-lr
     model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
+    fgfm = dict(fgfm_levels=args.fgfm_levels, fgfm_alpha=args.fgfm_alpha) if args.fgfm_levels else {}  # Swin only
     model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
-                        heatmap_min_sigma=args.heatmap_min_sigma).cuda()
+                        heatmap_min_sigma=args.heatmap_min_sigma, **fgfm).cuda()
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)
@@ -238,7 +252,8 @@ def main():
     # Train, validating every --eval-every epochs; the reported model is the last-epoch model
     history, start = [], time.time()
     for epoch in range(1, args.epochs + 1):
-        train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file, args.heatmap_weight)
+        train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file,
+                        {'heatmap': args.heatmap_weight, 'foreground': args.fgfm_loss_weight})
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val, val_detections = evaluate(model, val_loader, args.data / 'detection' / 'instances_val.json')
             history.append({'epoch': epoch, **val})

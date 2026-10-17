@@ -44,7 +44,9 @@ def load_model(run):
     if options['adapt'] != 'full':
         add_adapters(backbone, options['adapt'], options.get('lora_rank'))  # runs before --lora-rank: the default
     model_class = SwinMultiTaskModel if options['backbone'] in SWIN_MODELS else MultiTaskModel
-    model = model_class(backbone, task_routing=options['adapt'] == 'moelora')  # no heatmap head: training only
+    # FGFM runs at inference, so it is rebuilt; runs from before --fgfm-levels have no such option
+    fgfm = {k: options[k] for k in ('fgfm_levels', 'fgfm_alpha')} if options.get('fgfm_levels') else {}
+    model = model_class(backbone, task_routing=options['adapt'] == 'moelora', **fgfm)  # no heatmap head: training only
     state = torch.load(run / 'model.pt', map_location='cpu')
     model.load_state_dict({k: v for k, v in state.items() if not k.startswith('heatmap_head.')})
     return model.cuda().eval()

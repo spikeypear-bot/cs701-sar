@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from sarbench.adapters import add_adapters
+from sarbench.adapters import add_adapters, unfreeze_blocks
 from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
@@ -21,6 +21,15 @@ from sarbench.model import MultiTaskModel, SwinMultiTaskModel
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
 REF_F1, REF_MAP = 0.9399, 0.2541
+
+
+def parse_blocks(spec):
+    """'0-3,22' -> [0, 1, 2, 3, 22]"""
+    blocks = []
+    for part in filter(None, spec.split(',')):
+        first, _, last = part.partition('-')
+        blocks += range(int(first), int(last or first) + 1)
+    return blocks
 
 
 def parse_args():
@@ -42,6 +51,12 @@ def parse_args():
                    help='with LoRA/MoE-LoRA, also train the input layer (frozen otherwise), so the model can learn '
                         'how to mix --input-channels (Swin-B: 128 x channels x 16 + 384 parameters, its LayerNorm '
                         'included)')
+    p.add_argument('--unfreeze-blocks', type=parse_blocks, default=[],
+                   help='with LoRA/MoE-LoRA, also fully train these backbone blocks, e.g. 0-3 or 16-21,23 (Swin-B: '
+                        '0-1 stage 1, 2-3 stage 2, 4-21 stage 3, 22-23 stage 4; about 0.2, 0.8, 3.2 and 12.6 M '
+                        'parameters per block)')
+    p.add_argument('--unfreeze-lr', type=float, default=2e-5,
+                   help='for the pretrained weights of --unfreeze-blocks (default: 2e-5, as for full fine-tuning)')
     p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
     p.add_argument('--boxpaste-prob', type=float, default=0.0,
                    help='chance that a training image gets same-class BoxPaste objects (default: 0 = off)')
@@ -67,6 +82,8 @@ def parse_args():
         p.error('--init scratch is only valid with --adapt full')
     if args.backbone_lr is None:
         args.backbone_lr = args.lr
+    if args.unfreeze_blocks and args.adapt == 'full':
+        p.error('--unfreeze-blocks is for LoRA and MoE-LoRA; --adapt full trains every block already')
     if args.train_patch_embed and args.backbone == 'terramind':
         p.error('--train-patch-embed is for the ViT and Swin backbones')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):
@@ -190,10 +207,12 @@ def main():
     # Model: adapters are created on the CPU, so they are added before .cuda()
     backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
                               in_chans=len(args.input_channels.split(',')))
+    unfrozen = []
     if args.adapt != 'full':
         add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
         if args.train_patch_embed:
             backbone.patch_embed.requires_grad_(True)  # trained at --backbone-lr with the adapters
+        unfrozen = unfreeze_blocks(backbone, args.unfreeze_blocks)  # trained at --unfreeze-lr
     model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
     model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
                         heatmap_min_sigma=args.heatmap_min_sigma).cuda()
@@ -204,11 +223,15 @@ def main():
         log(f'WARNING: over the limits ({MAX_PARAMETERS / 1e6:.0f} M total, {MAX_TRAINABLE / 1e6:.0f} M trainable); '
             'not allowed for a submission', log_file)
 
-    # Optimizer and schedule: trainable backbone parameters at --backbone-lr, all new modules at --lr
-    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    # Optimizer and schedule: trainable backbone parameters at --backbone-lr (unfrozen blocks' pretrained weights at
+    # --unfreeze-lr), all new modules at --lr. .cuda() keeps the parameter objects, so `unfrozen` still matches
+    unfrozen_ids = {id(p) for p in unfrozen}
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad and id(p) not in unfrozen_ids]
     head_params = [p for name, p in model.named_parameters() if not name.startswith('backbone.')]
-    optimizer = torch.optim.AdamW([{'params': backbone_params, 'lr': args.backbone_lr}, {'params': head_params}],
-                                  lr=args.lr, weight_decay=args.weight_decay)
+    groups = [{'params': backbone_params, 'lr': args.backbone_lr}, {'params': head_params}]
+    if unfrozen:
+        groups.append({'params': unfrozen, 'lr': args.unfreeze_lr})
+    optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
     warmup, total = len(train_loader), args.epochs * len(train_loader)  # one epoch of warmup
     schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, warmup, total))
 

@@ -53,6 +53,15 @@ def add_adapters(backbone, kind, rank=None):
         blk.attn.proj = adapter(blk.attn.proj, **options)
 
 
+def unfreeze_blocks(backbone, indices):
+    """Make backbone.blocks[i] fully trainable for each i in `indices`, after add_adapters (their adapters stay).
+    Returns the newly trainable parameters, the pretrained weights, so they can get their own learning rate."""
+    frozen = [p for i in indices for p in backbone.blocks[i].parameters() if not p.requires_grad]
+    for p in frozen:
+        p.requires_grad_(True)
+    return frozen
+
+
 def set_task(module, task):
     """Route every MoELoRA inside `module` through the router of `task` (0 = classification, 1 = detection)."""
     for layer in module.modules():

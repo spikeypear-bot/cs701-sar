@@ -3,7 +3,7 @@ import pytest
 import torch
 from torch import nn
 
-from sarbench.adapters import LoRA, MoELoRA, add_adapters, set_task
+from sarbench.adapters import LoRA, MoELoRA, add_adapters, set_task, unfreeze_blocks
 from sarbench.backbones import build_backbone
 
 # 12 blocks x rank 16 x ((768 + 2304) + (768 + 768)) for A and B of qkv and proj;
@@ -76,3 +76,14 @@ def test_moelora_is_a_gated_sum_of_lora_experts():
     B = layer.up.weight.split(2, dim=1)  # B_e: [24, 2]
     experts = sum(gates[..., e, None] * (x @ A[e].T @ B[e].T) for e in range(3))
     torch.testing.assert_close(layer(x), layer.base(x) + 2 * experts)
+
+
+def test_unfreeze_blocks_trains_only_those_blocks():
+    backbone = build_backbone('swin_t', pretrained=False)
+    add_adapters(backbone, 'moelora')
+    adapters = {n for n, p in backbone.named_parameters() if p.requires_grad}
+    unfrozen = unfreeze_blocks(backbone, [0, 3])
+    expected = [p for i in (0, 3) for n, p in backbone.blocks[i].named_parameters() if not n.endswith(ADAPTER_WEIGHTS)]
+    assert {id(p) for p in unfrozen} == {id(p) for p in expected}
+    trainable = {n for n, p in backbone.named_parameters() if p.requires_grad}
+    assert trainable == adapters | {n for n, p in backbone.named_parameters() if any(p is q for q in unfrozen)}

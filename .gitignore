@@ -5,3 +5,5 @@ cs701-sar-course-data/
 /data
 logs/
 .env
+docs/claude.md
+submission*.zip

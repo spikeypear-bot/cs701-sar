@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from sarbench.adapters import add_adapters
 from sarbench.backbones import SWIN_MODELS, build_backbone
-from sarbench.data import SARMultiTask, collate, to_original_xywh
+from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import MultiTaskModel, SwinMultiTaskModel
 
@@ -35,6 +35,18 @@ def parse_args():
                    help='weight of the auxiliary object-centre heatmap loss, training only (default: 0 = no head)')
     p.add_argument('--heatmap-min-sigma', type=float, default=2.0,
                    help='smallest Gaussian sigma of the heatmap targets, in input pixels (default: 2)')
+    p.add_argument('--input-channels', default='raw',
+                   help=f'comma-separated input maps from {CHANNELS}, e.g. raw,nlm,cv (default: raw); see '
+                        'sarbench/data.py input_channels')
+    p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
+    p.add_argument('--boxpaste-prob', type=float, default=0.0,
+                   help='chance that a training image gets same-class BoxPaste objects (default: 0 = off)')
+    p.add_argument('--boxpaste-max', type=int, default=3, help='at most this many pasted objects per image')
+    p.add_argument('--boxpaste-max-size', type=float, default=32.0,
+                   help='only boxes up to this many original pixels per side are copied')
+    p.add_argument('--boxpaste-classes', default='ship,wind_turbine,oil_tank,car,aircraft',
+                   help='comma-separated classes BoxPaste copies (default: the compact ones; bridge, playground, '
+                        'harbor and airport need their surroundings)')
     p.add_argument('--epochs', type=int, default=24)
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-4)
@@ -51,6 +63,8 @@ def parse_args():
         p.error('--init scratch is only valid with --adapt full')
     if args.backbone_lr is None:
         args.backbone_lr = args.lr
+    if not set(args.input_channels.split(',')) <= set(CHANNELS):
+        p.error(f'--input-channels takes names from {CHANNELS}')
     return args
 
 
@@ -63,7 +77,10 @@ def log(message, file):
 def make_loader(args, split):
     """Batches of `split`; only the training set is shuffled and augmented."""
     train = split == 'train'
-    dataset = SARMultiTask(args.data, split, train=train, limit=args.limit)
+    boxpaste = {'prob': args.boxpaste_prob, 'max_pastes': args.boxpaste_max, 'max_size': args.boxpaste_max_size,
+                'classes': args.boxpaste_classes.split(',')} if args.boxpaste_prob > 0 else None
+    dataset = SARMultiTask(args.data, split, train=train, limit=args.limit, channels=args.input_channels.split(','),
+                           stats=args.channel_stats, boxpaste=boxpaste, rot90=args.rot90)
     return DataLoader(dataset, args.batch_size, shuffle=train, num_workers=args.workers, collate_fn=collate,
                       persistent_workers=train and args.workers > 0)  # training workers live across epochs
 
@@ -159,11 +176,14 @@ def main():
     commit, dirty = save_code_version(run_dir)
     log(f'code: commit {commit}' + (', with uncommitted changes (code.diff)' if dirty else ''), log_file)
 
-    # Data
+    # Data. The input channels' mean and std are saved with the run (metrics.json args), for predict.py
+    args.channel_stats = channel_stats(args.data, args.input_channels.split(','))
+    log(f'input channels {args.input_channels}: mean, std {args.channel_stats}', log_file)
     train_loader, val_loader, test_loader = (make_loader(args, split) for split in ('train', 'val', 'test'))
 
     # Model: adapters are created on the CPU, so they are added before .cuda()
-    backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained')
+    backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
+                              in_chans=len(args.input_channels.split(',')))
     if args.adapt != 'full':
         add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
     model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel

@@ -39,7 +39,8 @@ def parse_args():
 def load_model(run):
     """The model of a train.py run, rebuilt from the options in its metrics.json, with the weights of model.pt."""
     options = json.loads((run / 'metrics.json').read_text())['args']
-    backbone = build_backbone(options['backbone'], pretrained=False)  # every weight comes from model.pt
+    backbone = build_backbone(options['backbone'], pretrained=False,  # every weight comes from model.pt
+                              in_chans=len(options.get('input_channels', 'raw').split(',')))
     if options['adapt'] != 'full':
         add_adapters(backbone, options['adapt'], options.get('lora_rank'))  # runs before --lora-rank: the default
     model_class = SwinMultiTaskModel if options['backbone'] in SWIN_MODELS else MultiTaskModel
@@ -78,7 +79,9 @@ def score(zip_path, gt_json):
 
 def main():
     args = parse_args()
-    dataset = SARImages(args.images, args.root)
+    options = json.loads((args.run / 'metrics.json').read_text())['args']  # the run's input channels and their stats
+    dataset = SARImages(args.images, args.root, channels=options.get('input_channels', 'raw').split(','),
+                        stats=options.get('channel_stats'))
     loader = DataLoader(dataset, args.batch_size, num_workers=args.workers, collate_fn=collate_images)
     preds = predict(load_model(args.run), loader)
     write_submission(dataset.images, preds, out=args.out)

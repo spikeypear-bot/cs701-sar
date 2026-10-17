@@ -1,12 +1,16 @@
-"""sarbench/data.py on the real dataset: split contents, the box geometry round trip, and flips."""
+"""sarbench/data.py on the real dataset: split contents, the box geometry round trip, and flips; then the
+rotations, BoxPaste and the filter channels on synthetic images."""
+import random
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import tv_tensors
 
-from sarbench.data import MEAN, STD, SARMultiTask, collate, to_original_xywh
+from sarbench.data import MEAN, STD, BoxPaste, SARMultiTask, collate, input_channels, rot90, to_original_xywh
 from sarbench.metrics import detection_metrics
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
@@ -56,3 +60,44 @@ def test_flips_move_boxes_with_pixels():
         assert torch.allclose(bright.float(), out_box[0], atol=1)
         flips.add((out_box[0, 0].item() > 256, out_box[0, 1].item() > 256))  # (horizontal, vertical)
     assert len(flips) == 4  # the seeds cover every combination of the two flips
+
+
+def bright_box(image):
+    """The XYXY extent of the pixels above 0.5 of the first channel; pixel i spans [i, i + 1)."""
+    ys, xs = torch.nonzero(image[0] > 0.5, as_tuple=True)
+    return torch.stack([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]).float()
+
+
+def test_rot90_moves_boxes_with_pixels():
+    image = torch.zeros(1, 64, 64)
+    image[:, 10:20, 5:40] = 1  # a bright rectangle filling exactly this box:
+    box = torch.tensor([[5., 10., 40., 20.]])
+    for k in range(4):
+        out, out_box = rot90(image, box, k)
+        assert torch.equal(bright_box(out), out_box[0])
+
+
+def test_boxpaste_adds_free_boxes_over_the_pasted_objects(tmp_path):
+    donor = np.zeros((64, 64), dtype=np.uint8)
+    donor[20:28, 20:28] = 200  # an 8 px object at [20, 20, 8, 8]
+    Image.fromarray(donor).save(tmp_path / 'donor.png')
+    paste = BoxPaste([(tmp_path / 'donor.png', (64, 64), 3, [20., 20., 8., 8.])], prob=1, max_pastes=3, max_size=32)
+    gray = np.zeros((64, 64), dtype=np.uint8)
+    for seed in range(5):
+        random.seed(seed)
+        out, boxes = paste(gray, [[0., 0., 10., 10.]], category=3)
+        assert boxes[0] == [0., 0., 10., 10.] and 2 <= len(boxes) <= 4
+        for i, (x, y, w, h) in enumerate(boxes[1:], 1):
+            assert (w, h) == (8., 8.) and (out[int(y):int(y + h), int(x):int(x + w)] == 200).all()
+            for x2, y2, w2, h2 in boxes[:i]:  # no overlap with earlier boxes
+                assert x + w <= x2 or x2 + w2 <= x or y + h <= y2 or y2 + h2 <= y
+    assert paste(gray, [[0., 0., 10., 10.]], category=4)[1] == [[0., 0., 10., 10.]]  # no donors of class 4
+
+
+def test_input_channels_keep_raw_and_mark_bright_points():
+    gray = np.full((64, 64), 60, dtype=np.uint8)
+    gray[30:33, 30:33] = 250  # a bright 3 px point target
+    maps = input_channels(gray, ('raw', 'nlm', 'cv'))
+    assert maps.shape == (64, 64, 3) and maps.dtype == np.uint8
+    assert (maps[..., 0] == gray).all()
+    assert maps[31, 31, 2] > 50 and maps[5, 5, 2] == 0  # coefficient of variation: high at the point, 0 when flat

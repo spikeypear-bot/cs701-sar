@@ -5,4 +5,5 @@ timm==1.0.24
 terratorch==1.2.7
 torchgeo==0.9.0  # terratorch 1.2.7 imports torchgeo.trainers.utils, removed in torchgeo 0.10
 pycocotools==2.0.11
+opencv-python-headless==4.10.0.84  # --input-channels nlm,cv only; headless: no GUI on the cluster
 pytest==9.1.1

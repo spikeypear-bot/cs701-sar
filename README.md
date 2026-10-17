@@ -84,6 +84,8 @@ bash run_all.sh                                                  # all eight run
 
 - Options: `--backbone vit|terramind`, `--init pretrained|scratch`, `--adapt full|lora|moelora`
   (`python train.py -h`).
+- Extras, all off by default: `--heatmap-weight` (auxiliary object-centre heatmaps), `--rot90`, `--boxpaste-prob`
+  (same-class BoxPaste), `--input-channels raw,nlm,cv` (SAR filter channels; needs `opencv-python-headless`).
 - `--adapt full` and `--init scratch` train 106 M parameters: over the 40 M budget, for reference only.
 - Pretrained weights download from Hugging Face on first use (ViT 0.4 GB, TerraMind 1.5 GB).
 - Times for one RTX PRO 6000 Blackwell GPU. Memory: [docs/DETAILS.md](docs/DETAILS.md#time-and-memory).

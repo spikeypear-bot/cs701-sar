@@ -39,8 +39,9 @@ def parse_args():
 def load_model(run):
     """The model of a train.py run, rebuilt from the options in its metrics.json, with the weights of model.pt."""
     options = json.loads((run / 'metrics.json').read_text())['args']
+    size = options.get('image_size', 512)  # runs from before --image-size: 512
     backbone = build_backbone(options['backbone'], pretrained=False,  # every weight comes from model.pt
-                              in_chans=len(options.get('input_channels', 'raw').split(',')))
+                              in_chans=len(options.get('input_channels', 'raw').split(',')), img_size=size)
     if options.get('ssl_weights'):  # the SSL adapters under the task ones; their weights are in model.pt too
         add_adapters(backbone, 'lora', options['ssl_rank'])
     if options['adapt'] != 'full':
@@ -50,7 +51,7 @@ def load_model(run):
     fgfm = {k: options[k] for k in ('fgfm_levels', 'fgfm_alpha')} if options.get('fgfm_levels') else {}
     # Runs from before --detector are Faster R-CNN; no heatmap head: training only
     model = model_class(backbone, task_routing=options['adapt'] == 'moelora',
-                        detector=options.get('detector', 'faster_rcnn'), **fgfm)
+                        detector=options.get('detector', 'faster_rcnn'), image_size=size, **fgfm)
     state = torch.load(run / 'model.pt', map_location='cpu')
     model.load_state_dict({k: v for k, v in state.items() if not k.startswith('heatmap_head.')})
     return model.cuda().eval()
@@ -58,7 +59,7 @@ def load_model(run):
 
 @torch.no_grad()
 def predict(model, loader):
-    """preds[file_name] = (label 0..8, boxes XYXY on the 512 px input, classes 0..8, scores), as write_submission
+    """preds[file_name] = (label 0..8, boxes XYXY on the model input, classes 0..8, scores), as write_submission
     takes them."""
     preds = {}
     for images, infos in loader:
@@ -86,11 +87,12 @@ def score(zip_path, gt_json):
 def main():
     args = parse_args()
     options = json.loads((args.run / 'metrics.json').read_text())['args']  # the run's input channels and their stats
-    dataset = SARImages(args.images, args.root, channels=options.get('input_channels', 'raw').split(','),
+    size = options.get('image_size', 512)
+    dataset = SARImages(args.images, args.root, size=size, channels=options.get('input_channels', 'raw').split(','),
                         stats=options.get('channel_stats'))
     loader = DataLoader(dataset, args.batch_size, num_workers=args.workers, collate_fn=collate_images)
     preds = predict(load_model(args.run), loader)
-    write_submission(dataset.images, preds, out=args.out)
+    write_submission(dataset.images, preds, size=size, out=args.out)
     print(f'{len(preds)} images -> {args.out}')
     if 'annotations' in json.loads(args.images.read_text()):
         print(f'scores: {headline(score(args.out, args.images))}')

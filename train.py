@@ -104,8 +104,14 @@ def parse_args():
     p.add_argument('--boxpaste-classes', default='ship,wind_turbine,oil_tank,car,aircraft',
                    help='comma-separated classes BoxPaste copies (default: the compact ones; bridge, playground, '
                         'harbor and airport need their surroundings)')
+    p.add_argument('--image-size', type=int, default=512,
+                   help='side of the square model input in pixels, a multiple of 32; images are stretched to it and '
+                        'the anchors scale with it (default: 512; ViT and Swin)')
     p.add_argument('--epochs', type=int, default=24)
     p.add_argument('--batch-size', type=int, default=16)
+    p.add_argument('--accum-steps', type=int, default=1,
+                   help='optimizer step every N batches, gradients summed over them: --batch-size 8 --accum-steps 2 '
+                        'trains as batch 16 in half the memory (default: 1)')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--backbone-lr', type=float, help='for the trainable backbone parameters (default: --lr)')
     p.add_argument('--weight-decay', type=float, default=0.05)
@@ -135,6 +141,8 @@ def parse_args():
     if args.ssl_weights and (args.backbone not in SWIN_MODELS or args.adapt == 'full'
                              or args.init != 'pretrained' or args.input_channels != 'raw'):
         p.error('--ssl-weights needs a pretrained Swin backbone, --adapt lora or moelora and --input-channels raw')
+    if args.image_size % 32 or (args.image_size != 512 and args.backbone == 'terramind'):
+        p.error('--image-size must be a multiple of 32 (TerraMind: 512 only)')
     if not set(args.loss_weights) <= set(MAIN_LOSSES):
         p.error(f'--loss-weights takes names from {MAIN_LOSSES} (the auxiliary losses have their own flags)')
     return args
@@ -151,8 +159,9 @@ def make_loader(args, split):
     train = split == 'train'
     boxpaste = {'prob': args.boxpaste_prob, 'max_pastes': args.boxpaste_max, 'max_size': args.boxpaste_max_size,
                 'classes': args.boxpaste_classes.split(',')} if args.boxpaste_prob > 0 else None
-    dataset = SARMultiTask(args.data, split, train=train, limit=args.limit, channels=args.input_channels.split(','),
-                           stats=args.channel_stats, boxpaste=boxpaste, rot90=args.rot90)
+    dataset = SARMultiTask(args.data, split, train=train, size=args.image_size, limit=args.limit,
+                           channels=args.input_channels.split(','), stats=args.channel_stats, boxpaste=boxpaste,
+                           rot90=args.rot90)
     return DataLoader(dataset, args.batch_size, shuffle=train, num_workers=args.workers, collate_fn=collate,
                       persistent_workers=train and args.workers > 0)  # training workers live across epochs
 
@@ -164,10 +173,11 @@ def lr_factor(step, warmup, total):
     return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))  # --epochs 1: no decay phase
 
 
-def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights):
+def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights, accum_steps=1):
     """One pass over the training set; the loss is cross-entropy plus the detector's losses, plus the
     auxiliary losses the model returns ('heatmap', 'foreground'), each times weights[name]. The log shows each loss
-    before weighting."""
+    before weighting. One optimizer step per accum_steps batches, on the mean of their losses (the last step of
+    an epoch may have fewer)."""
     model.train()
     start, seen = time.time(), 0
     for step, (images, labels, targets) in enumerate(loader, 1):
@@ -176,10 +186,11 @@ def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights
             logits, _, det_losses = model(images.cuda(), targets)
             losses = {'classification': F.cross_entropy(logits, labels.cuda()), **det_losses}
         loss = sum(weights.get(name, 1.0) * value for name, value in losses.items())
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        schedule.step()
+        (loss / accum_steps).backward()
+        if step % accum_steps == 0 or step == len(loader):
+            optimizer.step()
+            optimizer.zero_grad()
+            schedule.step()
         seen += len(images)
         if step % 50 == 0 or step == len(loader):
             parts = ' '.join(f'{name} {value.item():.3f}' for name, value in losses.items())
@@ -189,8 +200,9 @@ def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights
 
 
 @torch.no_grad()
-def evaluate(model, loader, gt_json):
-    """Classification and COCO detection metrics on one split, and the detections in COCO result format."""
+def evaluate(model, loader, gt_json, size):
+    """Classification and COCO detection metrics on one split, and the detections in COCO result format; size: the
+    side of the model input."""
     model.eval()
     labels, predicted, detections, image_ids = [], [], [], []
     for images, y, targets in loader:
@@ -200,7 +212,7 @@ def evaluate(model, loader, gt_json):
         predicted += logits.argmax(dim=1).tolist()
         for target, out in zip(targets, outputs):
             image_ids.append(target['image_id'])
-            boxes = to_original_xywh(out['boxes'], target['orig_size']).tolist()
+            boxes = to_original_xywh(out['boxes'], target['orig_size'], size).tolist()
             detections += [{'image_id': target['image_id'], 'category_id': c, 'bbox': b, 'score': s}
                            for b, c, s in zip(boxes, out['labels'].tolist(), out['scores'].tolist())]
     metrics = {**classification_metrics(labels, predicted), **detection_metrics(gt_json, detections, image_ids)}
@@ -256,7 +268,7 @@ def main():
 
     # Model: adapters are created on the CPU, so they are added before .cuda()
     backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
-                              in_chans=len(args.input_channels.split(',')))
+                              in_chans=len(args.input_channels.split(',')), img_size=args.image_size)
     unfrozen, ssl_trained = [], []
     if args.ssl_weights:  # before the task adapters, which wrap the SSL ones
         checkpoint = torch.load(args.ssl_weights, map_location='cpu')
@@ -275,7 +287,7 @@ def main():
     fgfm = dict(fgfm_levels=args.fgfm_levels, fgfm_alpha=args.fgfm_alpha) if args.fgfm_levels else {}  # Swin only
     model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
                         heatmap_min_sigma=args.heatmap_min_sigma, rpn_match=args.rpn_match, nwd_c=args.nwd_c,
-                        detector=args.detector, **fgfm).cuda()
+                        detector=args.detector, image_size=args.image_size, **fgfm).cuda()
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)
@@ -297,22 +309,26 @@ def main():
     if unfrozen:
         groups.append({'params': unfrozen, 'lr': args.unfreeze_lr})
     optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
-    warmup, total = len(train_loader), args.epochs * len(train_loader)  # one epoch of warmup
+    steps_per_epoch = math.ceil(len(train_loader) / args.accum_steps)  # optimizer steps
+    warmup, total = steps_per_epoch, args.epochs * steps_per_epoch  # one epoch of warmup
     schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, warmup, total))
 
     # Train, validating every --eval-every epochs; the reported model is the last-epoch model
     history, start = [], time.time()
     for epoch in range(1, args.epochs + 1):
         train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file,
-                        {'heatmap': args.heatmap_weight, 'foreground': args.fgfm_loss_weight, **args.loss_weights})
+                        {'heatmap': args.heatmap_weight, 'foreground': args.fgfm_loss_weight, **args.loss_weights},
+                        args.accum_steps)
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            val, val_detections = evaluate(model, val_loader, args.data / 'detection' / 'instances_val.json')
+            val, val_detections = evaluate(model, val_loader, args.data / 'detection' / 'instances_val.json',
+                                           args.image_size)
             history.append({'epoch': epoch, **val})
             log(f'epoch {epoch} val: {headline(val)}', log_file)
     train_hours = (time.time() - start) / 3600
 
     # Evaluate on test, once
-    test, test_detections = evaluate(model, test_loader, args.data / 'detection' / 'instances_test.json')
+    test, test_detections = evaluate(model, test_loader, args.data / 'detection' / 'instances_test.json',
+                                     args.image_size)
     peak_gb = torch.cuda.max_memory_allocated() / 2**30
     log(f'test: {headline(test)}\ntraining {train_hours:.2f} h, peak GPU memory {peak_gb:.1f} GB', log_file)
 

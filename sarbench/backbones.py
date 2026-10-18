@@ -1,4 +1,4 @@
-"""The backbones, built for 512 px input. The two ViT-B/16: images [B, 1, 512, 512] -> patch tokens [B, 1024, 768].
+"""The backbones, built for 512 px input (img_size: another size, a multiple of 32). The two ViT-B/16: images [B, 1, 512, 512] -> patch tokens [B, 1024, 768].
 Swin: images [B, 1, 512, 512] -> 4 feature maps at strides 4, 8, 16 and 32. in_chans > 1 (ViT, Swin): input channels
 from SAR filters (data.input_channels); in_chans=3 keeps the RGB patch-embedding weights as they are."""
 import timm
@@ -9,11 +9,11 @@ from torch import nn
 class ViT(nn.Module):
     """timm ViT-B/16 pretrained on ImageNet-21k."""
 
-    def __init__(self, pretrained: bool, in_chans=1):
+    def __init__(self, pretrained: bool, in_chans=1, img_size=512):
         super().__init__()
-        # in_chans=1: timm sums the RGB patch-embedding weights; img_size=512: it resamples the position embedding
+        # in_chans=1: timm sums the RGB patch-embedding weights; img_size: it resamples the position embedding
         self.vit = timm.create_model('vit_base_patch16_224.augreg_in21k', pretrained=pretrained,
-                                     img_size=512, in_chans=in_chans, num_classes=0)
+                                     img_size=img_size, in_chans=in_chans, num_classes=0)
         self.embed_dim = 768
 
     @property
@@ -65,10 +65,10 @@ class Swin(nn.Module):
     7 x 7 (12 x 12 for swin_b384, 16 x 16 for swinv2_b) window (the maps of 128, 64, 32 and 16 are padded to whole
     windows)."""
 
-    def __init__(self, pretrained: bool, name: str, in_chans=1):
+    def __init__(self, pretrained: bool, name: str, in_chans=1, img_size=512):
         super().__init__()
         self.swin = timm.create_model(name, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3),
-                                      img_size=512, in_chans=in_chans)  # 1: timm sums the RGB patch-embedding weights
+                                      img_size=img_size, in_chans=in_chans)  # 1: timm sums the RGB patch-embedding weights
         for blk in self.blocks:
             if hasattr(blk.attn, 'qkv_bias_separate'):
                 # V2 computes F.linear(x, self.qkv.weight, qkv_bias), which bypasses (and breaks on) a LoRA wrapper of
@@ -91,13 +91,14 @@ class Swin(nn.Module):
         return [m.permute(0, 3, 1, 2) for m in self.swin(x)]  # timm gives [B, H, W, C]; the FPN takes [B, C, H, W]
 
 
-def build_backbone(name, pretrained, in_chans=1):
+def build_backbone(name, pretrained, in_chans=1, img_size=512):
     """name: 'vit', 'terramind' or a key of SWIN_MODELS. pretrained=False builds the same architecture with random
-    weights. in_chans: input channels (ViT and Swin; TerraMind takes the gray image only)."""
+    weights. in_chans: input channels (ViT and Swin; TerraMind takes the gray image only). img_size: input side in
+    pixels (ViT and Swin; TerraMind takes 512 only)."""
     if name in SWIN_MODELS:
-        return Swin(pretrained, SWIN_MODELS[name], in_chans)
+        return Swin(pretrained, SWIN_MODELS[name], in_chans, img_size)
     if name == 'terramind':
-        if in_chans != 1:
-            raise ValueError('TerraMind takes 1 input channel')
+        if in_chans != 1 or img_size != 512:
+            raise ValueError('TerraMind takes 1 input channel at 512 px')
         return TerraMind(pretrained)
-    return ViT(pretrained, in_chans)
+    return ViT(pretrained, in_chans, img_size)

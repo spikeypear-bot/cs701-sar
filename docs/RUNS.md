@@ -27,4 +27,6 @@ sbatch --gres=gpu:l40s:1 train.slurm --backbone swinv2_b --init pretrained --ada
 sbatch train.slurm pretrain_ssl.py --backbone swin_b --rank 64 --unfreeze-blocks 23 --epochs 100 --name swin_b-simmim-r64-uf23
 # MoE-LoRA on the SimMIM adapters (frozen, unmerged), 24 ep vs swin_b-moelora
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --ssl-weights runs/<swin_b-simmim-r64-uf23 run>/ssl.pt --name swin_b-moelora-simmim
+# 768 px input (anchors x 1.5), batch 8 x 2 accumulation (= 16; 512 px peaked at 23.8 GB), 24 ep vs swin_b-moelora; ~2.25x slower, so 10 h
+sbatch --gres=gpu:l40s:1 --time=10:00:00 train.slurm --backbone swin_b --init pretrained --adapt moelora --image-size 768 --batch-size 8 --accum-steps 2 --name swin_b-moelora-768
 ```

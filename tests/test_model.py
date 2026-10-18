@@ -10,7 +10,8 @@ from sarbench.adapters import MoELoRA, add_adapters
 from sarbench.backbones import build_backbone
 from sarbench.data import SARMultiTask, collate, to_original_xywh
 from sarbench.metrics import detection_metrics
-from sarbench.model import RPN_MATCH, MultiTaskModel, anchor_similarity, gaussian_heatmaps, heatmap_loss
+from sarbench.model import (RPN_MATCH, MultiTaskModel, SwinMultiTaskModel, anchor_similarity, gaussian_heatmaps,
+                            heatmap_loss)
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
 
@@ -177,3 +178,23 @@ def test_pretrained_vit_overfits_16_training_images():
                         for b, c, s in zip(boxes, d['labels'].tolist(), d['scores'].tolist())]
     image_ids = [t['image_id'] for t in targets]
     assert detection_metrics(ROOT / 'detection' / 'instances_train.json', predictions, image_ids)['AP50'] > 0.9
+
+
+def test_anchors_scale_with_the_image_size():
+    sizes = lambda size: MultiTaskModel(build_backbone('vit', pretrained=False, img_size=size), task_routing=False,
+                                        image_size=size).rpn.anchor_generator.sizes
+    assert sizes(768) == tuple(tuple(1.5 * a for a in level) for level in sizes(512))
+
+
+def test_swin_at_768_px_trains_and_detects_on_the_whole_image():
+    images, _, targets = first_train_images(2)
+    images = F.interpolate(images, size=768, mode='bilinear')
+    targets = [{**t, 'boxes': t['boxes'] * 1.5} for t in targets]
+    model = SwinMultiTaskModel(build_backbone('swin_t', pretrained=False, img_size=768), task_routing=False,
+                               image_size=768).cuda()
+    _, _, losses = forward(model.train(), images, targets)
+    assert all(loss.isfinite() for loss in losses.values())
+    with torch.no_grad():
+        logits, detections, _ = forward(model.eval(), images)
+    assert logits.shape == (2, 9) and len(detections) == 2
+    assert all(d['boxes'].numel() == 0 or d['boxes'].max() <= 768 for d in detections)

@@ -144,15 +144,18 @@ class MultiTaskModel(nn.Module):
     constant of NWD in input pixels; neither matters at inference, nor with RetinaNet."""
 
     def __init__(self, backbone, task_routing: bool, num_classes=9, heatmap=False, heatmap_min_sigma=2.0,
-                 rpn_match='iou', nwd_c=16.0, detector='faster_rcnn'):
+                 rpn_match='iou', nwd_c=16.0, detector='faster_rcnn', image_size=512):
         super().__init__()
         self.backbone = backbone
         self.task_routing = task_routing  # MoE-LoRA: the backbone runs once per task, with that task's routers
         self.cls_head = nn.Sequential(nn.LayerNorm(backbone.embed_dim), nn.Linear(backbone.embed_dim, num_classes))
         self.neck = SimpleFeaturePyramid(backbone.embed_dim)
         # Small objects (median ~16 px at 512 px, 99 % below ~240 px): two anchor scales per octave, from 8 px at
-        # stride 4 up to 181 px at stride 64, times 3 aspect ratios = 6 anchors per location.
-        anchors = AnchorGenerator(((8, 11), (16, 23), (32, 45), (64, 91), (128, 181)), ((0.5, 1.0, 2.0),) * 5)
+        # stride 4 up to 181 px at stride 64, times 3 aspect ratios = 6 anchors per location. At another image_size
+        # the anchors scale with the objects, so each object meets the same anchors and only gets more feature cells.
+        scale = image_size / 512
+        anchors = AnchorGenerator(tuple((a * scale, b * scale) for a, b in ((8, 11), (16, 23), (32, 45), (64, 91),
+                                                                           (128, 181))), ((0.5, 1.0, 2.0),) * 5)
         self.detector = detector
         if detector == 'retinanet':
             self.retinanet = RetinaNetDetector(anchors, num_classes)

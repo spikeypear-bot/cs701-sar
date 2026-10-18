@@ -9,7 +9,7 @@ from sarbench.adapters import MoELoRA, add_adapters
 from sarbench.backbones import build_backbone
 from sarbench.data import SARMultiTask, collate, to_original_xywh
 from sarbench.metrics import detection_metrics
-from sarbench.model import MultiTaskModel, gaussian_heatmaps, heatmap_loss
+from sarbench.model import RPN_MATCH, MultiTaskModel, anchor_similarity, gaussian_heatmaps, heatmap_loss
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
 
@@ -88,6 +88,26 @@ def test_heatmap_head_trains_only_and_predict_loads_without_it():
     assert plain.heatmap_head is None
     plain.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith('heatmap_head.')})
 
+
+
+def test_nwd_keeps_shifted_tiny_boxes_and_max_keeps_shifted_large_ones():
+    # An 8 px box with an 8 px anchor 2 px off in x and y; a 200 px box with a 200 px anchor 16 px off in x and y
+    gt = torch.tensor([[100., 100., 108., 108.], [100., 100., 300., 300.]])
+    anchors = torch.tensor([[102., 102., 110., 110.], [116., 116., 316., 316.]])
+    iou, nwd, best = (anchor_similarity(gt, anchors, mode, c=16.0) for mode in ('iou', 'nwd', 'max'))
+    assert iou[0, 0] < 0.4 < 0.7 < nwd[0, 0]  # tiny: not positive by IoU (0.39), positive by NWD (0.84)
+    assert nwd[1, 1] < 0.3 < 0.7 < iou[1, 1]  # large: positive by IoU (0.73), background by NWD (0.24)
+    assert torch.isclose(nwd[0, 0], torch.exp(torch.tensor(-8 ** 0.5 / 16)))  # W2 = |(2, 2, 0, 0)|
+    assert torch.equal(best, torch.maximum(iou, nwd))
+
+
+def test_rpn_match_sets_how_the_rpn_labels_anchors():
+    backbone = torch.nn.Identity()
+    backbone.embed_dim = 768  # all MultiTaskModel.__init__ reads from the backbone
+    gt, anchors = torch.tensor([[100., 100., 108., 108.]]), torch.tensor([[102., 102., 110., 110.]])
+    for mode in RPN_MATCH:
+        rpn = MultiTaskModel(backbone, task_routing=False, rpn_match=mode, nwd_c=16.0).rpn
+        assert torch.equal(rpn.box_similarity(gt, anchors), anchor_similarity(gt, anchors, mode, c=16.0))
 
 def test_pretrained_vit_overfits_16_training_images():
     torch.manual_seed(0)

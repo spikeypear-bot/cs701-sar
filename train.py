@@ -16,11 +16,13 @@ from sarbench.adapters import add_adapters, unfreeze_blocks
 from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
-from sarbench.model import MultiTaskModel, SwinMultiTaskModel
+from sarbench.model import RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
 
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
 REF_F1, REF_MAP = 0.9399, 0.2541
+# Cross-entropy of the image class, then torchvision's Faster R-CNN losses: RPN, then RoI heads
+MAIN_LOSSES = ('classification', 'loss_objectness', 'loss_rpn_box_reg', 'loss_classifier', 'loss_box_reg')
 
 
 def parse_blocks(spec):
@@ -30,6 +32,15 @@ def parse_blocks(spec):
         first, _, last = part.partition('-')
         blocks += range(int(first), int(last or first) + 1)
     return blocks
+
+
+def parse_loss_weights(spec):
+    """'loss_box_reg=2,classification=0.5' -> {'loss_box_reg': 2.0, 'classification': 0.5}"""
+    weights = {}
+    for part in filter(None, spec.split(',')):
+        name, _, value = part.partition('=')
+        weights[name.strip()] = float(value)
+    return weights
 
 
 def parse_args():
@@ -52,6 +63,17 @@ def parse_args():
                    help='modulation strength: lateral map x (1 + alpha x weights) (default: 0.8, as FGAA-FPN)')
     p.add_argument('--fgfm-loss-weight', type=float, default=0.7,
                    help='weight of the foreground mask loss (default: 0.7, as FGAA-FPN)')
+    p.add_argument('--rpn-match', choices=RPN_MATCH, default='iou',
+                   help='how the RPN labels anchors positive (>= 0.7) or background (< 0.3) in training: iou, nwd '
+                        '(normalized Gaussian Wasserstein distance, Wang et al. 2021: fairer to tiny objects) or max '
+                        '(the larger of the two: NWD for tiny boxes, IoU for large ones) (default: iou); see '
+                        'sarbench/model.py anchor_similarity')
+    p.add_argument('--nwd-c', type=float, default=16.0,
+                   help='NWD constant in input pixels (default: 16, the median box size at 512 px; the paper uses the '
+                        'mean box size, 35.6 here, but on AI-TOD, where nearly every box is tiny)')
+    p.add_argument('--loss-weights', type=parse_loss_weights, default={},
+                   help=f'weights of the main losses, e.g. loss_box_reg=2,classification=0.5 (names: '
+                        f'{", ".join(MAIN_LOSSES)}; default: all 1)')
     p.add_argument('--input-channels', default='raw',
                    help=f'comma-separated input maps from {CHANNELS}, e.g. raw,nlm,cv (default: raw); see '
                         'sarbench/data.py input_channels')
@@ -100,6 +122,8 @@ def parse_args():
         p.error('--fgfm-levels takes levels 0 to 3')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):
         p.error(f'--input-channels takes names from {CHANNELS}')
+    if not set(args.loss_weights) <= set(MAIN_LOSSES):
+        p.error(f'--loss-weights takes names from {MAIN_LOSSES} (the auxiliary losses have their own flags)')
     return args
 
 
@@ -229,7 +253,8 @@ def main():
     model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
     fgfm = dict(fgfm_levels=args.fgfm_levels, fgfm_alpha=args.fgfm_alpha) if args.fgfm_levels else {}  # Swin only
     model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
-                        heatmap_min_sigma=args.heatmap_min_sigma, **fgfm).cuda()
+                        heatmap_min_sigma=args.heatmap_min_sigma, rpn_match=args.rpn_match, nwd_c=args.nwd_c,
+                        **fgfm).cuda()
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)
@@ -253,7 +278,7 @@ def main():
     history, start = [], time.time()
     for epoch in range(1, args.epochs + 1):
         train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file,
-                        {'heatmap': args.heatmap_weight, 'foreground': args.fgfm_loss_weight})
+                        {'heatmap': args.heatmap_weight, 'foreground': args.fgfm_loss_weight, **args.loss_weights})
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val, val_detections = evaluate(model, val_loader, args.data / 'detection' / 'instances_val.json')
             history.append({'epoch': epoch, **val})

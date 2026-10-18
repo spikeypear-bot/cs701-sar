@@ -1,5 +1,6 @@
 """The multi-task model: one shared ViT backbone feeds a classification head and a Faster R-CNN detector."""
 from collections import OrderedDict
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -9,11 +10,34 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, TwoMLPHe
 from torchvision.models.detection.image_list import ImageList
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.rpn import RegionProposalNetwork, RPNHead
-from torchvision.ops import FeaturePyramidNetwork, MultiScaleRoIAlign
+from torchvision.ops import FeaturePyramidNetwork, MultiScaleRoIAlign, box_iou
 from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
 
 from .adapters import set_task
 from .fgfm import ForegroundFPN, box_masks, foreground_loss
+
+RPN_MATCH = ('iou', 'nwd', 'max')  # the choices of rpn_match, see anchor_similarity
+
+
+def anchor_similarity(gt_boxes, anchors, mode, c):
+    """[N, 4], [M, 4] XYXY -> [N, M], the match quality the RPN labels anchors by (positive >= 0.7, background < 0.3).
+    'iou': torchvision's default; 'nwd': normalized Gaussian Wasserstein distance (Wang et al., 2021, arXiv
+    2110.13389): each box as a 2D Gaussian (mean its centre, std half its size), exp(-W2 / c), W2 the Euclidean
+    distance of the (cx, cy, w / 2, h / 2) vectors. A shift of d px costs the same for every box size, while IoU falls
+    fastest for the smallest boxes: with 8 px anchors every 4 px, an 8 px object can be 2 px off its nearest anchor
+    in x and y: IoU 0.39, NWD 0.84 at c = 16. 'max': the larger of the two, NWD for tiny boxes and IoU for large
+    ones, which NWD's fixed c makes strict (a 200 px box 16 px off in x and y: IoU 0.73, NWD 0.24 at c = 16)."""
+    if mode == 'iou':
+        return box_iou(gt_boxes, anchors)
+
+    def gaussian(b):
+        return torch.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2,
+                            (b[:, 2] - b[:, 0]) / 2, (b[:, 3] - b[:, 1]) / 2], dim=1)
+
+    # Exact differences: cdist's matrix-product shortcut errs by up to ~0.2 px for close boxes near 512 px in fp32
+    w2 = torch.cdist(gaussian(gt_boxes), gaussian(anchors), compute_mode='donot_use_mm_for_euclid_dist')
+    nwd = torch.exp(-w2 / c)
+    return nwd if mode == 'nwd' else torch.maximum(nwd, box_iou(gt_boxes, anchors))
 
 
 class SimpleFeaturePyramid(nn.Module):
@@ -68,9 +92,12 @@ def heatmap_loss(logits, target, bce_weight=0.05, dice_weight=1.0):
 class MultiTaskModel(nn.Module):
     """backbone tokens -> classification logits (mean token -> LayerNorm -> Linear) and Faster R-CNN detections.
     heatmap=True adds an auxiliary head for training only: object-centre heatmaps on the stride-4 level '0', the level
-    of the smallest anchors, so every object, however small, sends a dense signal into the shared features."""
+    of the smallest anchors, so every object, however small, sends a dense signal into the shared features.
+    rpn_match ('iou', 'nwd' or 'max', see anchor_similarity) is how the RPN labels anchors in training, nwd_c the
+    constant of NWD in input pixels; neither matters at inference."""
 
-    def __init__(self, backbone, task_routing: bool, num_classes=9, heatmap=False, heatmap_min_sigma=2.0):
+    def __init__(self, backbone, task_routing: bool, num_classes=9, heatmap=False, heatmap_min_sigma=2.0,
+                 rpn_match='iou', nwd_c=16.0):
         super().__init__()
         self.backbone = backbone
         self.task_routing = task_routing  # MoE-LoRA: the backbone runs once per task, with that task's routers
@@ -84,6 +111,8 @@ class MultiTaskModel(nn.Module):
             anchors, RPNHead(256, 6), fg_iou_thresh=0.7, bg_iou_thresh=0.3, batch_size_per_image=256,
             positive_fraction=0.5, pre_nms_top_n=dict(training=2000, testing=1000),
             post_nms_top_n=dict(training=2000, testing=1000), nms_thresh=0.7)
+        if rpn_match != 'iou':  # same thresholds as with IoU, as in Wang et al. (2021)
+            self.rpn.box_similarity = partial(anchor_similarity, mode=rpn_match, c=nwd_c)
         self.roi_heads = RoIHeads(
             MultiScaleRoIAlign(['0', '1', '2', '3'], output_size=7, sampling_ratio=2),
             TwoMLPHead(256 * 7 * 7, 1024), FastRCNNPredictor(1024, num_classes + 1),  # + 1: background
@@ -131,10 +160,9 @@ class SwinMultiTaskModel(MultiTaskModel):
     The classification head, anchors, RPN and RoI heads are MultiTaskModel's, unchanged. fgfm_levels (e.g. [0, 1, 2])
     puts foreground-guided feature modulation on those FPN levels (sarbench/fgfm.py); it runs at inference too."""
 
-    def __init__(self, backbone, task_routing: bool, num_classes=9, fgfm_levels=(), fgfm_alpha=0.8,
-                 **heatmap_options):
-        # cls_head on backbone.embed_dim, anchors, rpn, roi_heads, heatmap_head
-        super().__init__(backbone, task_routing, num_classes, **heatmap_options)
+    def __init__(self, backbone, task_routing: bool, num_classes=9, fgfm_levels=(), fgfm_alpha=0.8, **options):
+        # cls_head on backbone.embed_dim, anchors, rpn, roi_heads, heatmap_head; options: heatmap and rpn_match ones
+        super().__init__(backbone, task_routing, num_classes, **options)
         # Replaces the ViTDet neck. LastLevelMaxPool adds the stride-64 'pool' level that the anchors expect.
         if fgfm_levels:
             self.neck = ForegroundFPN(backbone.channels, 256, fgfm_levels, fgfm_alpha, extra_blocks=LastLevelMaxPool())

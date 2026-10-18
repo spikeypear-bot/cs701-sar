@@ -29,4 +29,6 @@ sbatch train.slurm pretrain_ssl.py --backbone swin_b --rank 64 --unfreeze-blocks
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --ssl-weights runs/<swin_b-simmim-r64-uf23 run>/ssl.pt --name swin_b-moelora-simmim
 # 768 px input (anchors x 1.5), batch 8 x 2 accumulation (= 16; 512 px peaked at 23.8 GB), 24 ep vs swin_b-moelora; ~2.25x slower, so 10 h
 sbatch --gres=gpu:l40s:1 --time=10:00:00 train.slurm --backbone swin_b --init pretrained --adapt moelora --image-size 768 --batch-size 8 --accum-steps 2 --name swin_b-moelora-768
+# YOLOv8m (COCO, all 25.9 M trained) + image-class head on SPPF, in place of Swin-B + FPN + Faster R-CNN; AdamW 1e-3, wd 5e-4; 48 ep vs swin_b-moelora-e48-uf01
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-e48
 ```

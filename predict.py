@@ -18,6 +18,7 @@ from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import SARImages, collate_images
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import MultiTaskModel, SwinMultiTaskModel
+from sarbench.yolo import YOLO_MODELS, YOLOMultiTaskModel
 from train import headline
 
 
@@ -40,6 +41,12 @@ def load_model(run):
     """The model of a train.py run, rebuilt from the options in its metrics.json, with the weights of model.pt."""
     options = json.loads((run / 'metrics.json').read_text())['args']
     size = options.get('image_size', 512)  # runs from before --image-size: 512
+    state = torch.load(run / 'model.pt', map_location='cpu')
+    if options['backbone'] in YOLO_MODELS:  # the whole detector, rebuilt from its Ultralytics config
+        model = YOLOMultiTaskModel(options['backbone'], pretrained=False,
+                                   in_chans=len(options.get('input_channels', 'raw').split(',')))
+        model.load_state_dict(state)
+        return model.cuda().eval()
     backbone = build_backbone(options['backbone'], pretrained=False,  # every weight comes from model.pt
                               in_chans=len(options.get('input_channels', 'raw').split(',')), img_size=size)
     if options.get('ssl_weights'):  # the SSL adapters under the task ones; their weights are in model.pt too
@@ -52,7 +59,6 @@ def load_model(run):
     # Runs from before --detector are Faster R-CNN; no heatmap head: training only
     model = model_class(backbone, task_routing=options['adapt'] == 'moelora',
                         detector=options.get('detector', 'faster_rcnn'), image_size=size, **fgfm)
-    state = torch.load(run / 'model.pt', map_location='cpu')
     model.load_state_dict({k: v for k, v in state.items() if not k.startswith('heatmap_head.')})
     return model.cuda().eval()
 

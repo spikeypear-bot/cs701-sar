@@ -7,3 +7,7 @@ torchgeo==0.9.0  # terratorch 1.2.7 imports torchgeo.trainers.utils, removed in 
 pycocotools==2.0.11
 opencv-python-headless==4.10.0.84  # --input-channels nlm,cv only; headless: no GUI on the cluster
 pytest==9.1.1
+# YOLO runs only (sarbench/yolo.py): ultralytics==8.3.100, not listed here because its own pins (opencv-python,
+# numpy<=2.1.1) clash with the ones above. Install it without them:
+#   pip install --no-deps ultralytics==8.3.100 ultralytics-thop
+#   pip install matplotlib pyyaml requests scipy tqdm psutil py-cpuinfo pandas seaborn

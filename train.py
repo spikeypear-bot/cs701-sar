@@ -18,13 +18,15 @@ from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_ori
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import DETECTORS, RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
 from sarbench.simmim import load_ssl
+from sarbench.yolo import YOLO_MODELS, YOLOMultiTaskModel
 
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
 REF_F1, REF_MAP = 0.9399, 0.2541
-# Cross-entropy of the image class, then the detector's losses: Faster R-CNN's (RPN, then RoI heads) or RetinaNet's
+# Cross-entropy of the image class, then the detector's losses: Faster R-CNN's (RPN, then RoI heads), RetinaNet's or
+# YOLO's (sarbench/yolo.py)
 MAIN_LOSSES = ('classification', 'loss_objectness', 'loss_rpn_box_reg', 'loss_classifier', 'loss_box_reg',
-               'loss_focal', 'loss_retina_box_reg')
+               'loss_focal', 'loss_retina_box_reg', 'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl')
 
 
 def parse_blocks(spec):
@@ -48,7 +50,9 @@ def parse_loss_weights(spec):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, default=Path(__file__).resolve().parents[1] / 'dataset' / 'SARFact-Course-20K')
-    p.add_argument('--backbone', required=True, choices=['vit', 'terramind', *SWIN_MODELS])
+    p.add_argument('--backbone', required=True, choices=['vit', 'terramind', *SWIN_MODELS, *YOLO_MODELS],
+                   help='a YOLO model is the whole detector, its own neck and head included (sarbench/yolo.py); it '
+                        'takes --adapt full only')
     p.add_argument('--init', required=True, choices=['pretrained', 'scratch'])
     p.add_argument('--adapt', required=True, choices=['full', 'lora', 'moelora'])
     p.add_argument('--lora-rank', type=int, help='rank of each LoRA adapter (MoE-LoRA: of each expert), alpha = 2 x '
@@ -143,6 +147,10 @@ def parse_args():
         p.error('--ssl-weights needs a pretrained Swin backbone, --adapt lora or moelora and --input-channels raw')
     if args.image_size % 32 or (args.image_size != 512 and args.backbone == 'terramind'):
         p.error('--image-size must be a multiple of 32 (TerraMind: 512 only)')
+    if args.backbone in YOLO_MODELS and (args.adapt != 'full' or args.detector != 'faster_rcnn'
+                                         or args.rpn_match != 'iou' or args.heatmap_weight or args.train_patch_embed):
+        p.error('a YOLO backbone takes --adapt full and none of --detector, --rpn-match, --heatmap-weight, '
+                '--train-patch-embed: it is a whole detector of its own')
     if not set(args.loss_weights) <= set(MAIN_LOSSES):
         p.error(f'--loss-weights takes names from {MAIN_LOSSES} (the auxiliary losses have their own flags)')
     return args
@@ -267,27 +275,33 @@ def main():
     train_loader, val_loader, test_loader = (make_loader(args, split) for split in ('train', 'val', 'test'))
 
     # Model: adapters are created on the CPU, so they are added before .cuda()
-    backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
-                              in_chans=len(args.input_channels.split(',')), img_size=args.image_size)
     unfrozen, ssl_trained = [], []
-    if args.ssl_weights:  # before the task adapters, which wrap the SSL ones
-        checkpoint = torch.load(args.ssl_weights, map_location='cpu')
-        if checkpoint['backbone'] != args.backbone:
-            raise ValueError(f'{args.ssl_weights} is for {checkpoint["backbone"]}, not {args.backbone}')
-        ssl_trained = load_ssl(backbone, checkpoint)
-        args.ssl_rank = checkpoint['rank']  # in metrics.json, for predict.py
-        log(f'SSL weights {args.ssl_weights}: LoRA rank {checkpoint["rank"]}, blocks '
-            f'{checkpoint["unfreeze_blocks"]} unfrozen, {checkpoint["trained_parameters"]:,} parameters trained', log_file)
-    if args.adapt != 'full':
-        add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
-        if args.train_patch_embed:
-            backbone.patch_embed.requires_grad_(True)  # trained at --backbone-lr with the adapters
-        unfrozen = unfreeze_blocks(backbone, args.unfreeze_blocks)  # trained at --unfreeze-lr
-    model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
-    fgfm = dict(fgfm_levels=args.fgfm_levels, fgfm_alpha=args.fgfm_alpha) if args.fgfm_levels else {}  # Swin only
-    model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
-                        heatmap_min_sigma=args.heatmap_min_sigma, rpn_match=args.rpn_match, nwd_c=args.nwd_c,
-                        detector=args.detector, image_size=args.image_size, **fgfm).cuda()
+    if args.backbone in YOLO_MODELS:  # a whole detector, every parameter trained (sarbench/yolo.py)
+        model = YOLOMultiTaskModel(args.backbone, pretrained=args.init == 'pretrained',
+                                   in_chans=len(args.input_channels.split(','))).cuda()
+        log(f'{args.backbone}: {model.transferred} tensors from the COCO weights', log_file)
+    else:
+        backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
+                                  in_chans=len(args.input_channels.split(',')), img_size=args.image_size)
+        if args.ssl_weights:  # before the task adapters, which wrap the SSL ones
+            checkpoint = torch.load(args.ssl_weights, map_location='cpu')
+            if checkpoint['backbone'] != args.backbone:
+                raise ValueError(f'{args.ssl_weights} is for {checkpoint["backbone"]}, not {args.backbone}')
+            ssl_trained = load_ssl(backbone, checkpoint)
+            args.ssl_rank = checkpoint['rank']  # in metrics.json, for predict.py
+            log(f'SSL weights {args.ssl_weights}: LoRA rank {checkpoint["rank"]}, blocks '
+                f'{checkpoint["unfreeze_blocks"]} unfrozen, {checkpoint["trained_parameters"]:,} parameters trained',
+                log_file)
+        if args.adapt != 'full':
+            add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
+            if args.train_patch_embed:
+                backbone.patch_embed.requires_grad_(True)  # trained at --backbone-lr with the adapters
+            unfrozen = unfreeze_blocks(backbone, args.unfreeze_blocks)  # trained at --unfreeze-lr
+        model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
+        fgfm = dict(fgfm_levels=args.fgfm_levels, fgfm_alpha=args.fgfm_alpha) if args.fgfm_levels else {}  # Swin only
+        model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
+                            heatmap_min_sigma=args.heatmap_min_sigma, rpn_match=args.rpn_match, nwd_c=args.nwd_c,
+                            detector=args.detector, image_size=args.image_size, **fgfm).cuda()
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)

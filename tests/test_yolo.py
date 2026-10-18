@@ -42,6 +42,14 @@ def test_coco_weights_load_on_one_channel_except_the_new_class_convs():
     assert sum(p.numel() for p in model.parameters() if p.requires_grad) < 40e6
 
 
+def test_yolov8l_with_6_frozen_layers_is_under_the_trainable_limit():
+    model = YOLOMultiTaskModel('yolov8l', pretrained=False, freeze_layers=6)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    assert 39.6e6 < trainable < 40e6
+    assert not any(p.requires_grad for p in model.backbone.model[:6].parameters())
+    assert all(p.requires_grad for p in model.backbone.model[6].parameters())
+
+
 def test_predict_rebuilds_the_model_from_a_run_folder(tmp_path):
     model = YOLOMultiTaskModel('yolov8m', pretrained=False).cuda().eval()
     torch.save(model.state_dict(), tmp_path / 'model.pt')

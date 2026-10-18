@@ -97,6 +97,9 @@ def parse_args():
     p.add_argument('--ssl-weights', type=Path,
                    help='ssl.pt of pretrain_ssl.py: its SimMIM-trained LoRA adapters (and blocks) go on the backbone, '
                         'frozen and unmerged, under the --adapt adapters; Swin, LoRA/MoE-LoRA and raw input only')
+    p.add_argument('--freeze-layers', type=int, default=0,
+                   help='YOLO only: freeze its layers 0..N-1, as Ultralytics\' freeze=N (yolov8l: 6 is the least that '
+                        'keeps it under 40 M trainable, 39.7 M; default: 0)')
     p.add_argument('--unfreeze-lr', type=float, default=2e-5,
                    help='for the pretrained weights of --unfreeze-blocks (default: 2e-5, as for full fine-tuning)')
     p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
@@ -151,6 +154,8 @@ def parse_args():
                                          or args.rpn_match != 'iou' or args.heatmap_weight or args.train_patch_embed):
         p.error('a YOLO backbone takes --adapt full and none of --detector, --rpn-match, --heatmap-weight, '
                 '--train-patch-embed: it is a whole detector of its own')
+    if args.freeze_layers and args.backbone not in YOLO_MODELS:
+        p.error('--freeze-layers is for the YOLO backbones')
     if not set(args.loss_weights) <= set(MAIN_LOSSES):
         p.error(f'--loss-weights takes names from {MAIN_LOSSES} (the auxiliary losses have their own flags)')
     return args
@@ -278,7 +283,8 @@ def main():
     unfrozen, ssl_trained = [], []
     if args.backbone in YOLO_MODELS:  # a whole detector, every parameter trained (sarbench/yolo.py)
         model = YOLOMultiTaskModel(args.backbone, pretrained=args.init == 'pretrained',
-                                   in_chans=len(args.input_channels.split(','))).cuda()
+                                   in_chans=len(args.input_channels.split(',')),
+                                   freeze_layers=args.freeze_layers).cuda()
         log(f'{args.backbone}: {model.transferred} tensors from the COCO weights', log_file)
     else:
         backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',

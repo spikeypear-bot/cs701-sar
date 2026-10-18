@@ -9,8 +9,9 @@ import torch
 from torch import nn
 from torchvision.ops import box_convert, clip_boxes_to_image
 
-YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolo11s', 'yolo11m')  # the choices of --backbone; parameters with COCO's 80
-# classes (a little fewer at 9): v8s 11.2 M, v8m 25.9 M, 11s 9.4 M, 11m 20.1 M, all trained (v8l, 43.7 M, is over 40 M)
+YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolov8l', 'yolo11s', 'yolo11m')  # the choices of --backbone; parameters with
+# COCO's 80 classes (a little fewer at 9): v8s 11.2 M, v8m 25.9 M, v8l 43.7 M, 11s 9.4 M, 11m 20.1 M. v8l is over the
+# 40 M trainable limit unless its first 6 layers are frozen (freeze_layers=6: 39.7 M trainable at 9 classes)
 WEIGHTS_URL = 'https://github.com/ultralytics/assets/releases/download/v8.3.0/{}.pt'  # COCO detection weights
 
 
@@ -35,13 +36,14 @@ class YOLOMultiTaskModel(nn.Module):
     """images [B, C, H, W] -> classification logits (global average of the SPPF map -> LayerNorm -> Linear) and
     YOLO detections. `backbone` is the whole YOLO network (backbone, neck and head): it is pretrained, so train.py gives
     it --backbone-lr, and the new classification head --lr. Only the head's last class convs start untrained (9
-    classes instead of COCO's 80).
+    classes instead of COCO's 80). freeze_layers=N freezes YOLO layers 0..N-1, as Ultralytics' freeze=N (their BatchNorm
+    statistics still adapt to SAR in training mode; they are buffers, not trained parameters).
     Training: YOLO's own loss (task-aligned assignment, BCE classes, CIoU + DFL boxes; Ultralytics' gains 7.5, 0.5,
     1.5), per image. Inference: Ultralytics' validation settings, confidence >= 0.001, NMS at IoU 0.7, one box may
     carry several classes; at most 100 detections per image, as COCO mAP counts."""
 
-    def __init__(self, name, pretrained: bool, in_chans=1, num_classes=9, score_thresh=0.001, nms_thresh=0.7,
-                 detections_per_img=100):
+    def __init__(self, name, pretrained: bool, in_chans=1, num_classes=9, freeze_layers=0, score_thresh=0.001,
+                 nms_thresh=0.7, detections_per_img=100):
         super().__init__()
         from ultralytics.nn.tasks import DetectionModel
         self.backbone = DetectionModel(f'{name}.yaml', ch=in_chans, nc=num_classes, verbose=False)
@@ -53,6 +55,7 @@ class YOLOMultiTaskModel(nn.Module):
             self.backbone.load_state_dict(state, strict=False)
             self.transferred = len(state)
         layers = self.backbone.model
+        layers[:freeze_layers].requires_grad_(False)
         # SPPF ends YOLOv8's backbone; YOLO11 has one attention block (C2PSA) after it
         self.sppf = next(m.i for m in layers if type(m).__name__ == 'SPPF')
         channels = layers[self.sppf].cv2.conv.out_channels  # v8m: 576

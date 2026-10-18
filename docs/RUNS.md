@@ -31,4 +31,6 @@ sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --ssl-wei
 sbatch --gres=gpu:l40s:1 --time=10:00:00 train.slurm --backbone swin_b --init pretrained --adapt moelora --image-size 768 --batch-size 8 --accum-steps 2 --name swin_b-moelora-768
 # YOLOv8m (COCO, all 25.9 M trained) + image-class head on SPPF, in place of Swin-B + FPN + Faster R-CNN; AdamW 1e-3, wd 5e-4; 48 ep vs swin_b-moelora-e48-uf01
 sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-e48
+# YOLOv8l (COCO) with layers 0-5 frozen (39.7 M trainable) + image-class head, AdamW 1e-3, wd 5e-4; 48 ep vs yolov8m-e48; ~2x v8m's compute, so 10 h
+sbatch --time=10:00:00 train.slurm --backbone yolov8l --init pretrained --adapt full --freeze-layers 6 --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8l-f6-e48
 ```

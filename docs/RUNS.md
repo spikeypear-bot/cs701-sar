@@ -15,4 +15,10 @@ sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --rpn-mat
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --loss-weights loss_box_reg=2 --name swin_b-moelora-boxreg2
 # Swin-B pretrained at 384 px (12 x 12 windows), 24 ep vs swin_b-moelora
 sbatch train.slurm --backbone swin_b384 --init pretrained --adapt moelora --name swin_b384-moelora
+# Unfreeze the last Swin-B block (23, stage 4, ~12.6 M; trainable ~31 M), 24 ep vs swin_b-moelora
+sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --unfreeze-blocks 23 --name swin_b-moelora-uf23
+# 3 x 3 multi-look averaging as the input instead of raw, 24 ep vs swin_b-moelora
+sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --input-channels ml --name swin_b-moelora-ml
+# RetinaNet in place of Faster R-CNN (same anchors and FPN), 24 ep vs swin_b-moelora
+sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --detector retinanet --name swin_b-moelora-retina
 ```

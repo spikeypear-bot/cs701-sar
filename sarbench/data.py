@@ -18,7 +18,8 @@ from torchvision.transforms import v2
 # Mean and std of all pixels of the 9,392 train images, read as gray, resized to
 # 512 x 512 and scaled to [0, 1] (computed once).
 MEAN, STD = 0.2526, 0.2133
-CHANNELS = ('raw', 'nlm', 'cv', 'gre')  # the choices of input_channels
+CHANNELS = ('raw', 'nlm', 'cv', 'gre', 'ml')  # the choices of input_channels
+ML_LOOKS = 3  # 'ml' averages ML_LOOKS x ML_LOOKS pixels; odd, so the window is centred and boxes stay aligned
 
 
 def _cv2():
@@ -48,7 +49,10 @@ def input_channels(gray, channels):
     'gre': gradient by ratio (ROEWA, Fjortoft et al., 1998, as in SAR-SIFT and SARDet-100K's filter augmentation):
     the magnitude of the log ratios of exponentially weighted means on opposite sides of each pixel, horizontally and
     vertically. A ratio, not a difference, so speckle, which is multiplicative, does not raise it on bright ground;
-    [0, 2] scaled to [0, 255]."""
+    [0, 2] scaled to [0, 255];
+    'ml': multi-look averaging: the mean intensity (amplitude squared) over ML_LOOKS x ML_LOOKS pixels, back to
+    amplitude, so speckle std falls about ML_LOOKS times at that loss of resolution. A sliding window, not
+    decimation: the map keeps the image size, so the boxes need no change."""
     maps = []
     for name in channels:
         if name == 'raw':
@@ -67,6 +71,9 @@ def input_channels(gray, channels):
             gx = np.log(cv2.sepFilter2D(x, -1, after, whole) / cv2.sepFilter2D(x, -1, before, whole))  # right / left
             gy = np.log(cv2.sepFilter2D(x, -1, whole, after) / cv2.sepFilter2D(x, -1, whole, before))  # below / above
             maps.append((np.clip(np.hypot(gx, gy), 0, 2) * 127.5).astype(np.uint8))
+        elif name == 'ml':
+            cv2, x = _cv2(), gray.astype(np.float32)
+            maps.append(np.clip(np.sqrt(cv2.blur(x * x, (ML_LOOKS, ML_LOOKS))), 0, 255).astype(np.uint8))
         else:
             raise ValueError(f'unknown input channel {name!r}, expected one of {CHANNELS}')
     return np.stack(maps, axis=-1)

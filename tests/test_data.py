@@ -103,6 +103,16 @@ def test_input_channels_keep_raw_and_mark_bright_points():
     assert maps[31, 31, 2] > 50 and maps[5, 5, 2] == 0  # coefficient of variation: high at the point, 0 when flat
 
 
+def test_multilook_lowers_speckle_and_keeps_intensity():
+    """3 x 3 multi-look on 1-look speckle (Rayleigh amplitude): std about 3x lower, mean intensity unchanged."""
+    rng = np.random.default_rng(0)
+    speckled = np.clip(100 * np.sqrt(rng.exponential(1, (64, 64))), 0, 255).astype(np.uint8)
+    ml = input_channels(speckled, ('ml',))[..., 0].astype(float)
+    assert ml.shape == speckled.shape
+    assert ml.std() < 0.5 * speckled.std()
+    assert abs((ml ** 2).mean() / (speckled.astype(float) ** 2).mean() - 1) < 0.05
+
+
 def test_gre_marks_edges_but_not_speckle():
     """Gradient by ratio: high at a step edge, about equal on dark and bright speckled ground (multiplicative noise)."""
     rng = np.random.default_rng(0)

@@ -16,13 +16,14 @@ from sarbench.adapters import add_adapters, unfreeze_blocks
 from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
-from sarbench.model import RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
+from sarbench.model import DETECTORS, RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
 
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
 REF_F1, REF_MAP = 0.9399, 0.2541
-# Cross-entropy of the image class, then torchvision's Faster R-CNN losses: RPN, then RoI heads
-MAIN_LOSSES = ('classification', 'loss_objectness', 'loss_rpn_box_reg', 'loss_classifier', 'loss_box_reg')
+# Cross-entropy of the image class, then the detector's losses: Faster R-CNN's (RPN, then RoI heads) or RetinaNet's
+MAIN_LOSSES = ('classification', 'loss_objectness', 'loss_rpn_box_reg', 'loss_classifier', 'loss_box_reg',
+               'loss_focal', 'loss_retina_box_reg')
 
 
 def parse_blocks(spec):
@@ -63,6 +64,9 @@ def parse_args():
                    help='modulation strength: lateral map x (1 + alpha x weights) (default: 0.8, as FGAA-FPN)')
     p.add_argument('--fgfm-loss-weight', type=float, default=0.7,
                    help='weight of the foreground mask loss (default: 0.7, as FGAA-FPN)')
+    p.add_argument('--detector', choices=DETECTORS, default='faster_rcnn',
+                   help='faster_rcnn (RPN + RoI heads) or retinanet (one stage, focal loss), on the same anchors and '
+                        'FPN maps (default: faster_rcnn); see sarbench/model.py RetinaNetDetector')
     p.add_argument('--rpn-match', choices=RPN_MATCH, default='iou',
                    help='how the RPN labels anchors positive (>= 0.7) or background (< 0.3) in training: iou, nwd '
                         '(normalized Gaussian Wasserstein distance, Wang et al. 2021: fairer to tiny objects) or max '
@@ -122,6 +126,8 @@ def parse_args():
         p.error('--fgfm-levels takes levels 0 to 3')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):
         p.error(f'--input-channels takes names from {CHANNELS}')
+    if args.detector == 'retinanet' and args.rpn_match != 'iou':
+        p.error('--rpn-match is for Faster R-CNN: RetinaNet has no RPN')
     if not set(args.loss_weights) <= set(MAIN_LOSSES):
         p.error(f'--loss-weights takes names from {MAIN_LOSSES} (the auxiliary losses have their own flags)')
     return args
@@ -152,7 +158,7 @@ def lr_factor(step, warmup, total):
 
 
 def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights):
-    """One pass over the training set; the loss is cross-entropy plus the four Faster R-CNN losses, plus the
+    """One pass over the training set; the loss is cross-entropy plus the detector's losses, plus the
     auxiliary losses the model returns ('heatmap', 'foreground'), each times weights[name]. The log shows each loss
     before weighting."""
     model.train()
@@ -254,7 +260,7 @@ def main():
     fgfm = dict(fgfm_levels=args.fgfm_levels, fgfm_alpha=args.fgfm_alpha) if args.fgfm_levels else {}  # Swin only
     model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
                         heatmap_min_sigma=args.heatmap_min_sigma, rpn_match=args.rpn_match, nwd_c=args.nwd_c,
-                        **fgfm).cuda()
+                        detector=args.detector, **fgfm).cuda()
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)

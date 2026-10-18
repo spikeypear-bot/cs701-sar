@@ -1,13 +1,16 @@
-"""The multi-task model: one shared ViT backbone feeds a classification head and a Faster R-CNN detector."""
+"""The multi-task model: one shared ViT backbone feeds a classification head and a detector (Faster R-CNN or
+RetinaNet)."""
 from collections import OrderedDict
 from functools import partial
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchvision.models.detection import _utils as det_utils
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, TwoMLPHead
 from torchvision.models.detection.image_list import ImageList
+from torchvision.models.detection.retinanet import RetinaNet, RetinaNetHead
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.rpn import RegionProposalNetwork, RPNHead
 from torchvision.ops import FeaturePyramidNetwork, MultiScaleRoIAlign, box_iou
@@ -17,6 +20,7 @@ from .adapters import set_task
 from .fgfm import ForegroundFPN, box_masks, foreground_loss
 
 RPN_MATCH = ('iou', 'nwd', 'max')  # the choices of rpn_match, see anchor_similarity
+DETECTORS = ('faster_rcnn', 'retinanet')  # the choices of detector
 
 
 def anchor_similarity(gt_boxes, anchors, mode, c):
@@ -89,15 +93,58 @@ def heatmap_loss(logits, target, bce_weight=0.05, dice_weight=1.0):
     return bce_weight * bce + dice_weight * dice.mean()
 
 
+class RetinaNetDetector(nn.Module):
+    """RetinaNet (Lin et al., 2017) in place of the RPN + RoI heads: torchvision's head (4 convs per branch, focal
+    loss, L1 box loss), anchor matching (IoU >= 0.5 object, < 0.4 background, every box keeps its best anchor) and
+    post-processing, on the same anchors and FPN maps. torchvision's RetinaNet module also resizes and normalizes the
+    images, which data.py does already, so only its detector methods are borrowed here."""
+    compute_loss = RetinaNet.compute_loss  # reads self.head and self.proposal_matcher
+    postprocess_detections = RetinaNet.postprocess_detections  # self.box_coder and the four thresholds below
+
+    def __init__(self, anchors, num_classes):
+        super().__init__()
+        self.anchor_generator = anchors
+        self.num_anchors = anchors.num_anchors_per_location()[0]  # per location, the same on every level
+        # One column per class, without background (sigmoid focal loss): labels 1..9 are columns 0..8
+        self.head = RetinaNetHead(256, self.num_anchors, num_classes)
+        self.proposal_matcher = det_utils.Matcher(0.5, 0.4, allow_low_quality_matches=True)
+        self.box_coder = det_utils.BoxCoder(weights=(1.0, 1.0, 1.0, 1.0))
+        # torchvision's defaults, except 100 detections per image (300 there), as the Faster R-CNN and COCO mAP
+        self.score_thresh, self.nms_thresh, self.detections_per_img, self.topk_candidates = 0.05, 0.5, 100, 1000
+
+    def forward(self, image_list, features, targets=None):
+        """fp32 features {name: [B, 256, h, w]} -> (per-image detections with labels 1..9 (eval mode),
+        {'loss_focal', 'loss_retina_box_reg'} (training mode)).
+        Unlike the RPN head (one conv), this head is 8 convs on every level, the stride-4 one included: in fp32 it
+        would cost more than the backbone. So it runs in the caller's bf16, and only its outputs go to fp32, before
+        they meet the anchors (see the precision rule in MultiTaskModel.detect)."""
+        features = list(features.values())
+        head_outputs = self.head(features)
+        with torch.autocast(image_list.tensors.device.type, enabled=False):
+            head_outputs = {name: out.float() for name, out in head_outputs.items()}
+            anchors = self.anchor_generator(image_list, features)  # fp32 like the features
+            if self.training:
+                targets = [{**t, 'labels': t['labels'] - 1} for t in targets]  # column of the class
+                losses = self.compute_loss(targets, head_outputs, anchors)
+                # Not 'classification': train.py uses that name for the image class
+                return [], {'loss_focal': losses['classification'], 'loss_retina_box_reg': losses['bbox_regression']}
+            per_level = [f.shape[-2] * f.shape[-1] * self.num_anchors for f in features]
+            head_outputs = {name: list(out.split(per_level, dim=1)) for name, out in head_outputs.items()}
+            anchors = [list(a.split(per_level)) for a in anchors]
+            detections = self.postprocess_detections(head_outputs, anchors, image_list.image_sizes)
+        return [{**d, 'labels': d['labels'] + 1} for d in detections], {}
+
+
 class MultiTaskModel(nn.Module):
-    """backbone tokens -> classification logits (mean token -> LayerNorm -> Linear) and Faster R-CNN detections.
+    """backbone tokens -> classification logits (mean token -> LayerNorm -> Linear) and detections.
+    detector: 'faster_rcnn' (RPN + RoI heads) or 'retinanet' (RetinaNetDetector), on the same anchors.
     heatmap=True adds an auxiliary head for training only: object-centre heatmaps on the stride-4 level '0', the level
     of the smallest anchors, so every object, however small, sends a dense signal into the shared features.
     rpn_match ('iou', 'nwd' or 'max', see anchor_similarity) is how the RPN labels anchors in training, nwd_c the
-    constant of NWD in input pixels; neither matters at inference."""
+    constant of NWD in input pixels; neither matters at inference, nor with RetinaNet."""
 
     def __init__(self, backbone, task_routing: bool, num_classes=9, heatmap=False, heatmap_min_sigma=2.0,
-                 rpn_match='iou', nwd_c=16.0):
+                 rpn_match='iou', nwd_c=16.0, detector='faster_rcnn'):
         super().__init__()
         self.backbone = backbone
         self.task_routing = task_routing  # MoE-LoRA: the backbone runs once per task, with that task's routers
@@ -106,18 +153,21 @@ class MultiTaskModel(nn.Module):
         # Small objects (median ~16 px at 512 px, 99 % below ~240 px): two anchor scales per octave, from 8 px at
         # stride 4 up to 181 px at stride 64, times 3 aspect ratios = 6 anchors per location.
         anchors = AnchorGenerator(((8, 11), (16, 23), (32, 45), (64, 91), (128, 181)), ((0.5, 1.0, 2.0),) * 5)
-        # Everything else is torchvision's Faster R-CNN default.
-        self.rpn = RegionProposalNetwork(
-            anchors, RPNHead(256, 6), fg_iou_thresh=0.7, bg_iou_thresh=0.3, batch_size_per_image=256,
-            positive_fraction=0.5, pre_nms_top_n=dict(training=2000, testing=1000),
-            post_nms_top_n=dict(training=2000, testing=1000), nms_thresh=0.7)
-        if rpn_match != 'iou':  # same thresholds as with IoU, as in Wang et al. (2021)
-            self.rpn.box_similarity = partial(anchor_similarity, mode=rpn_match, c=nwd_c)
-        self.roi_heads = RoIHeads(
-            MultiScaleRoIAlign(['0', '1', '2', '3'], output_size=7, sampling_ratio=2),
-            TwoMLPHead(256 * 7 * 7, 1024), FastRCNNPredictor(1024, num_classes + 1),  # + 1: background
-            fg_iou_thresh=0.5, bg_iou_thresh=0.5, batch_size_per_image=512, positive_fraction=0.25,
-            bbox_reg_weights=None, score_thresh=0.05, nms_thresh=0.5, detections_per_img=100)
+        self.detector = detector
+        if detector == 'retinanet':
+            self.retinanet = RetinaNetDetector(anchors, num_classes)
+        else:  # Everything else is torchvision's Faster R-CNN default
+            self.rpn = RegionProposalNetwork(
+                anchors, RPNHead(256, 6), fg_iou_thresh=0.7, bg_iou_thresh=0.3, batch_size_per_image=256,
+                positive_fraction=0.5, pre_nms_top_n=dict(training=2000, testing=1000),
+                post_nms_top_n=dict(training=2000, testing=1000), nms_thresh=0.7)
+            if rpn_match != 'iou':  # same thresholds as with IoU, as in Wang et al. (2021)
+                self.rpn.box_similarity = partial(anchor_similarity, mode=rpn_match, c=nwd_c)
+            self.roi_heads = RoIHeads(
+                MultiScaleRoIAlign(['0', '1', '2', '3'], output_size=7, sampling_ratio=2),
+                TwoMLPHead(256 * 7 * 7, 1024), FastRCNNPredictor(1024, num_classes + 1),  # + 1: background
+                fg_iou_thresh=0.5, bg_iou_thresh=0.5, batch_size_per_image=512, positive_fraction=0.25,
+                bbox_reg_weights=None, score_thresh=0.05, nms_thresh=0.5, detections_per_img=100)
         # Unused at inference: predict.py builds the model without it and skips its weights
         self.heatmap_head = nn.Sequential(nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(),
                                           nn.Conv2d(128, 1, 1)) if heatmap else None
@@ -132,9 +182,23 @@ class MultiTaskModel(nn.Module):
         target = gaussian_heatmaps(targets, logits.shape[-1], stride, self.heatmap_min_sigma)
         return {'heatmap': heatmap_loss(logits, target)}
 
+    def detect(self, images, features, targets):
+        """The detector on the neck's maps -> (per-image detections (eval mode), its losses (training mode)).
+        Precision rule: the box coder casts anchors to the dtype of the regression output, so in bf16 every
+        coordinate near 512 would snap to a 2 px grid. The detector therefore gets fp32 maps, and RPN and RoIHeads
+        run in fp32; RetinaNet's head runs in bf16 and casts its outputs (see RetinaNetDetector.forward)."""
+        features = {name: f.float() for name, f in features.items()}
+        image_list = ImageList(images, [tuple(images.shape[-2:])] * len(images))
+        if self.detector == 'retinanet':
+            return self.retinanet(image_list, features, targets)
+        with torch.autocast(images.device.type, enabled=False):
+            proposals, rpn_losses = self.rpn(image_list, features, targets)
+            detections, roi_losses = self.roi_heads(features, proposals, image_list.image_sizes, targets)
+        return detections, {**rpn_losses, **roi_losses}
+
     def forward(self, images, targets=None):
         """images [B, 1, H, W], targets: per-image {'boxes' XYXY, 'labels' 1..9} (training only) ->
-        (logits [B, num_classes], per-image detections (eval mode), the four Faster R-CNN losses (training mode),
+        (logits [B, num_classes], per-image detections (eval mode), the detector's losses (training mode),
         plus 'heatmap' when training with the heatmap head)."""
         set_task(self.backbone, 0)  # 0 = classification, 1 = detection; a no-op without MoE-LoRA
         tokens = self.backbone(images)
@@ -145,23 +209,17 @@ class MultiTaskModel(nn.Module):
         h, w = images.shape[-2] // 16, images.shape[-1] // 16  # one token per 16 x 16 patch
         features = self.neck(tokens.transpose(1, 2).unflatten(2, (h, w)))  # tokens as a [B, 768, h, w] map
         heatmap = self.heatmap_losses(images, features, targets)  # bf16 features, before the fp32 detector
-        # Precision rule: the box coder casts anchors to the dtype of the regression output, so in bf16 every
-        # coordinate near 512 would snap to a 2 px grid. RPN and RoIHeads therefore run in fp32.
-        with torch.autocast(images.device.type, enabled=False):
-            features = {name: f.float() for name, f in features.items()}
-            image_list = ImageList(images, [tuple(images.shape[-2:])] * len(images))
-            proposals, rpn_losses = self.rpn(image_list, features, targets)
-            detections, roi_losses = self.roi_heads(features, proposals, image_list.image_sizes, targets)
-        return logits, detections, {**rpn_losses, **roi_losses, **heatmap}
+        detections, det_losses = self.detect(images, features, targets)
+        return logits, detections, {**det_losses, **heatmap}
 
 
 class SwinMultiTaskModel(MultiTaskModel):
     """MultiTaskModel on a Swin backbone: its 4 real maps (strides 4-32) go through an FPN instead of the ViTDet neck.
-    The classification head, anchors, RPN and RoI heads are MultiTaskModel's, unchanged. fgfm_levels (e.g. [0, 1, 2])
+    The classification head, anchors and detector are MultiTaskModel's, unchanged. fgfm_levels (e.g. [0, 1, 2])
     puts foreground-guided feature modulation on those FPN levels (sarbench/fgfm.py); it runs at inference too."""
 
     def __init__(self, backbone, task_routing: bool, num_classes=9, fgfm_levels=(), fgfm_alpha=0.8, **options):
-        # cls_head on backbone.embed_dim, anchors, rpn, roi_heads, heatmap_head; options: heatmap and rpn_match ones
+        # cls_head on backbone.embed_dim, the detector, heatmap_head; options: heatmap, rpn_match and detector ones
         super().__init__(backbone, task_routing, num_classes, **options)
         # Replaces the ViTDet neck. LastLevelMaxPool adds the stride-64 'pool' level that the anchors expect.
         if fgfm_levels:
@@ -195,10 +253,5 @@ class SwinMultiTaskModel(MultiTaskModel):
         features, mask_logits = features if isinstance(self.neck, ForegroundFPN) else (features, {})
         auxiliary = {**self.heatmap_losses(images, features, targets),
                      **self.foreground_losses(images, mask_logits, targets)}
-        # From here on as in MultiTaskModel.forward: the detector in fp32 (see the precision rule there)
-        with torch.autocast(images.device.type, enabled=False):
-            features = {name: f.float() for name, f in features.items()}
-            image_list = ImageList(images, [tuple(images.shape[-2:])] * len(images))
-            proposals, rpn_losses = self.rpn(image_list, features, targets)
-            detections, roi_losses = self.roi_heads(features, proposals, image_list.image_sizes, targets)
-        return logits, detections, {**rpn_losses, **roi_losses, **auxiliary}
+        detections, det_losses = self.detect(images, features, targets)
+        return logits, detections, {**det_losses, **auxiliary}

@@ -1,5 +1,6 @@
 """sarbench/model.py on real images: outputs and losses, fp32 detection heads under bf16 autocast, one backbone pass
-per task with MoE-LoRA, and an overfit check (a pretrained ViT fits 16 training images)."""
+per task with MoE-LoRA, RetinaNet in place of Faster R-CNN, and overfit checks (a pretrained ViT fits 16 training
+images, with either detector)."""
 from pathlib import Path
 
 import torch
@@ -88,6 +89,49 @@ def test_heatmap_head_trains_only_and_predict_loads_without_it():
     assert plain.heatmap_head is None
     plain.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith('heatmap_head.')})
 
+
+def test_retinanet_returns_its_two_losses_and_fp32_unquantized_boxes():
+    model = MultiTaskModel(build_backbone('vit', pretrained=False), task_routing=False, detector='retinanet').cuda()
+    assert not hasattr(model, 'rpn') and not hasattr(model, 'roi_heads')
+    images, _, targets = first_train_images(2)
+    _, detections, losses = forward(model.train(), images, targets)
+    assert detections == [] and set(losses) == {'loss_focal', 'loss_retina_box_reg'}  # 'classification' stays free
+    assert all(loss.dtype == torch.float32 and loss.isfinite() for loss in losses.values())
+    model.retinanet.score_thresh = 0.0  # untrained, every score is near the 0.01 prior, below the 0.05 default
+    with torch.no_grad():
+        _, detections, losses = forward(model.eval(), images)
+    assert losses == {} and len(detections) == 2
+    boxes, labels = torch.cat([d['boxes'] for d in detections]), torch.cat([d['labels'] for d in detections])
+    assert all(0 < len(d['boxes']) <= 100 for d in detections)
+    assert boxes.dtype == torch.float32 and detections[0]['scores'].dtype == torch.float32
+    assert boxes.min() >= 0 and boxes.max() <= 512 and labels.min() >= 1 and labels.max() <= 9  # as Faster R-CNN's
+    assert (boxes != boxes.bfloat16().float()).any()  # not every coordinate is on the bf16 grid
+
+
+def test_retinanet_overfits_16_training_images():
+    """As the Faster R-CNN overfit check below, detection only: labels 1..9 must map to the focal-loss columns 0..8
+    and back, or AP50 stays near 0."""
+    torch.manual_seed(0)
+    images, _, targets = first_train_images(16)
+    model = MultiTaskModel(build_backbone('vit', pretrained=True), task_routing=False, detector='retinanet')
+    model = model.cuda().train()
+    heads = [p for name, p in model.named_parameters() if not name.startswith('backbone.')]
+    optimizer = torch.optim.AdamW([{'params': model.backbone.parameters(), 'lr': 2e-5}, {'params': heads}], lr=1e-4)
+    for _ in range(200):
+        loss = sum(forward(model, images, targets)[2].values())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        detections = forward(model.eval(), images)[1]
+    predictions = []
+    for t, d in zip(targets, detections):
+        boxes = to_original_xywh(d['boxes'], t['orig_size']).tolist()
+        predictions += [{'image_id': t['image_id'], 'category_id': c, 'bbox': b, 'score': s}
+                        for b, c, s in zip(boxes, d['labels'].tolist(), d['scores'].tolist())]
+    image_ids = [t['image_id'] for t in targets]
+    assert detection_metrics(ROOT / 'detection' / 'instances_train.json', predictions, image_ids)['AP50'] > 0.5
 
 
 def test_nwd_keeps_shifted_tiny_boxes_and_max_keeps_shifted_large_ones():

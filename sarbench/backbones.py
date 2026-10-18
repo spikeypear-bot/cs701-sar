@@ -52,13 +52,14 @@ class TerraMind(nn.Module):
 SWIN_MODELS = {
     'swin_t': 'swin_tiny_patch4_window7_224.ms_in22k_ft_in1k',
     'swin_b': 'swin_base_patch4_window7_224.ms_in22k_ft_in1k',
+    'swin_b384': 'swin_base_patch4_window12_384.ms_in22k_ft_in1k',  # same weights count, 384 px, 12 x 12 windows
 }
 
 
 class Swin(nn.Module):
     """A timm Swin Transformer, its 4 stages as feature maps [B, C_i, 512 / s, 512 / s] for s = 4, 8, 16, 32.
-    Pretrained at 224 px, which is fine at 512: Swin's only position information is relative, inside each 7 x 7
-    window (the maps of 128, 64, 32 and 16 are padded to whole windows)."""
+    Pretrained at 224 or 384 px, which is fine at 512: Swin's only position information is relative, inside each
+    7 x 7 (12 x 12 for swin_b384) window (the maps of 128, 64, 32 and 16 are padded to whole windows)."""
 
     def __init__(self, pretrained: bool, name: str, in_chans=1):
         super().__init__()

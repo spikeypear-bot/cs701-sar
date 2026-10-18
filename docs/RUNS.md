@@ -13,4 +13,6 @@ sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --rpn-mat
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --rpn-match max --name swin_b-moelora-nwdmax
 # loss_box_reg x 2, 24 ep vs swin_b-moelora
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --loss-weights loss_box_reg=2 --name swin_b-moelora-boxreg2
+# Swin-B pretrained at 384 px (12 x 12 windows), 24 ep vs swin_b-moelora
+sbatch train.slurm --backbone swin_b384 --init pretrained --adapt moelora --name swin_b384-moelora
 ```

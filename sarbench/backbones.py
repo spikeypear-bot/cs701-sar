@@ -53,18 +53,27 @@ SWIN_MODELS = {
     'swin_t': 'swin_tiny_patch4_window7_224.ms_in22k_ft_in1k',
     'swin_b': 'swin_base_patch4_window7_224.ms_in22k_ft_in1k',
     'swin_b384': 'swin_base_patch4_window12_384.ms_in22k_ft_in1k',  # same weights count, 384 px, 12 x 12 windows
+    # Swin V2-B (cosine attention, log-spaced continuous position bias, post-norm): pretrained with 12 x 12 windows at
+    # 192 px, fine-tuned with 16 x 16 at 256; 16 divides all four maps at 512, so no padding
+    'swinv2_b': 'swinv2_base_window12to16_192to256.ms_in22k_ft_in1k',
 }
 
 
 class Swin(nn.Module):
-    """A timm Swin Transformer, its 4 stages as feature maps [B, C_i, 512 / s, 512 / s] for s = 4, 8, 16, 32.
-    Pretrained at 224 or 384 px, which is fine at 512: Swin's only position information is relative, inside each
-    7 x 7 (12 x 12 for swin_b384) window (the maps of 128, 64, 32 and 16 are padded to whole windows)."""
+    """A timm Swin Transformer (V1 or V2), its 4 stages as feature maps [B, C_i, 512 / s, 512 / s] for s = 4, 8, 16, 32.
+    Pretrained at 224, 256 or 384 px, which is fine at 512: Swin's only position information is relative, inside each
+    7 x 7 (12 x 12 for swin_b384, 16 x 16 for swinv2_b) window (the maps of 128, 64, 32 and 16 are padded to whole
+    windows)."""
 
     def __init__(self, pretrained: bool, name: str, in_chans=1):
         super().__init__()
         self.swin = timm.create_model(name, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3),
                                       img_size=512, in_chans=in_chans)  # 1: timm sums the RGB patch-embedding weights
+        for blk in self.blocks:
+            if hasattr(blk.attn, 'qkv_bias_separate'):
+                # V2 computes F.linear(x, self.qkv.weight, qkv_bias), which bypasses (and breaks on) a LoRA wrapper of
+                # qkv; separate calls self.qkv(x) and then adds the bias (qkv itself has none), the same output
+                blk.attn.qkv_bias_separate = True
         self.channels = self.swin.feature_info.channels()  # Swin-T [96, 192, 384, 768], Swin-B [128, ..., 1024]
         self.embed_dim = self.channels[-1]  # the last map's channels, the input of the classification head
 

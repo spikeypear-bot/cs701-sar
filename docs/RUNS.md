@@ -21,4 +21,6 @@ sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --unfreez
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --input-channels ml --name swin_b-moelora-ml
 # RetinaNet in place of Faster R-CNN (same anchors and FPN), 24 ep vs swin_b-moelora
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --detector retinanet --name swin_b-moelora-retina
+# Swin V2-B (in22k -> in1k, 16 x 16 windows) in place of Swin-B, 24 ep vs swin_b-moelora
+sbatch --gres=gpu:l40s:1 train.slurm --backbone swinv2_b --init pretrained --adapt moelora --name swinv2_b-moelora
 ```

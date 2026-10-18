@@ -23,4 +23,8 @@ sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --input-c
 sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --detector retinanet --name swin_b-moelora-retina
 # Swin V2-B (in22k -> in1k, 16 x 16 windows) in place of Swin-B, 24 ep vs swin_b-moelora
 sbatch --gres=gpu:l40s:1 train.slurm --backbone swinv2_b --init pretrained --adapt moelora --name swinv2_b-moelora
+# SimMIM SSL on the train images (no labels): LoRA r64 on every block + block 23 unfrozen, 512 px, 100 ep; if it stops at --max-hours, resubmit with: sbatch train.slurm pretrain_ssl.py --resume runs/<this run>
+sbatch train.slurm pretrain_ssl.py --backbone swin_b --rank 64 --unfreeze-blocks 23 --epochs 100 --name swin_b-simmim-r64-uf23
+# MoE-LoRA on the SimMIM adapters (frozen, unmerged), 24 ep vs swin_b-moelora
+sbatch train.slurm --backbone swin_b --init pretrained --adapt moelora --ssl-weights runs/<swin_b-simmim-r64-uf23 run>/ssl.pt --name swin_b-moelora-simmim
 ```

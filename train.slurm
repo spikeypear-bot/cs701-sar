@@ -29,4 +29,7 @@ nvidia-smi                          # which GPU this job got, at the top of the 
 
 # The env's python by full path: when sbatch runs from a shell with cs701bench already active, `module load` puts
 # Anaconda's base python first on PATH and `conda activate` (seeing the env already active) does not fix it.
-srun "$CONDA_PREFIX/bin/python" train.py --data data "$@"
+# A first argument ending in .py picks another script: sbatch train.slurm pretrain_ssl.py --backbone swin_b ...
+script=train.py
+if [[ "$1" == *.py ]]; then script=$1; shift; fi
+srun "$CONDA_PREFIX/bin/python" "$script" --data data "$@"

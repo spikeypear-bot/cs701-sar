@@ -41,6 +41,8 @@ def load_model(run):
     options = json.loads((run / 'metrics.json').read_text())['args']
     backbone = build_backbone(options['backbone'], pretrained=False,  # every weight comes from model.pt
                               in_chans=len(options.get('input_channels', 'raw').split(',')))
+    if options.get('ssl_weights'):  # the SSL adapters under the task ones; their weights are in model.pt too
+        add_adapters(backbone, 'lora', options['ssl_rank'])
     if options['adapt'] != 'full':
         add_adapters(backbone, options['adapt'], options.get('lora_rank'))  # runs before --lora-rank: the default
     model_class = SwinMultiTaskModel if options['backbone'] in SWIN_MODELS else MultiTaskModel

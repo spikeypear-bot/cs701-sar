@@ -245,6 +245,33 @@ class SARImages(Dataset):
         return self.transform(input_channels(gray, self.channels)), info
 
 
+class SARPretrain(Dataset):
+    """The gray images of classification/{split}.csv without labels or boxes, for pretrain_ssl.py, stretched to
+    size x size as SARMultiTask does. Training adds SimMIM's random resized crop (67-100 % of the area, aspect 3:4 to
+    4:3) of that and SARMultiTask's flips. An item is an image [1, size, size]."""
+
+    def __init__(self, root, split, train=False, size=512, limit=None):
+        self.root = Path(root)
+        with open(self.root / 'classification' / f'{split}.csv') as f:
+            self.rows = list(csv.DictReader(f))[:limit]
+        augment = [v2.RandomResizedCrop(size, scale=(0.67, 1.0), ratio=(3 / 4, 4 / 3)),
+                   v2.RandomHorizontalFlip(), v2.RandomVerticalFlip()] if train else []
+        self.transform = v2.Compose([
+            v2.ToImage(),
+            v2.Resize((size, size)),
+            *augment,
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize([MEAN], [STD]),
+        ])
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        gray = np.asarray(Image.open(self.root / self.rows[i]['image']).convert('L'))
+        return self.transform(gray[..., None])  # [H, W, 1]: ToImage makes it [1, H, W]
+
+
 def collate_images(batch):
     """Stack the images of SARImages; their images.json entries stay a list."""
     images, infos = zip(*batch)

@@ -17,6 +17,7 @@ from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import DETECTORS, RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
+from sarbench.simmim import load_ssl
 
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
@@ -89,6 +90,9 @@ def parse_args():
                    help='with LoRA/MoE-LoRA, also fully train these backbone blocks, e.g. 0-3 or 16-21,23 (Swin-B: '
                         '0-1 stage 1, 2-3 stage 2, 4-21 stage 3, 22-23 stage 4; about 0.2, 0.8, 3.2 and 12.6 M '
                         'parameters per block)')
+    p.add_argument('--ssl-weights', type=Path,
+                   help='ssl.pt of pretrain_ssl.py: its SimMIM-trained LoRA adapters (and blocks) go on the backbone, '
+                        'frozen and unmerged, under the --adapt adapters; Swin, LoRA/MoE-LoRA and raw input only')
     p.add_argument('--unfreeze-lr', type=float, default=2e-5,
                    help='for the pretrained weights of --unfreeze-blocks (default: 2e-5, as for full fine-tuning)')
     p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
@@ -128,6 +132,9 @@ def parse_args():
         p.error(f'--input-channels takes names from {CHANNELS}')
     if args.detector == 'retinanet' and args.rpn_match != 'iou':
         p.error('--rpn-match is for Faster R-CNN: RetinaNet has no RPN')
+    if args.ssl_weights and (args.backbone not in SWIN_MODELS or args.adapt == 'full'
+                             or args.init != 'pretrained' or args.input_channels != 'raw'):
+        p.error('--ssl-weights needs a pretrained Swin backbone, --adapt lora or moelora and --input-channels raw')
     if not set(args.loss_weights) <= set(MAIN_LOSSES):
         p.error(f'--loss-weights takes names from {MAIN_LOSSES} (the auxiliary losses have their own flags)')
     return args
@@ -250,7 +257,15 @@ def main():
     # Model: adapters are created on the CPU, so they are added before .cuda()
     backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
                               in_chans=len(args.input_channels.split(',')))
-    unfrozen = []
+    unfrozen, ssl_trained = [], []
+    if args.ssl_weights:  # before the task adapters, which wrap the SSL ones
+        checkpoint = torch.load(args.ssl_weights, map_location='cpu')
+        if checkpoint['backbone'] != args.backbone:
+            raise ValueError(f'{args.ssl_weights} is for {checkpoint["backbone"]}, not {args.backbone}')
+        ssl_trained = load_ssl(backbone, checkpoint)
+        args.ssl_rank = checkpoint['rank']  # in metrics.json, for predict.py
+        log(f'SSL weights {args.ssl_weights}: LoRA rank {checkpoint["rank"]}, blocks '
+            f'{checkpoint["unfreeze_blocks"]} unfrozen, {checkpoint["trained_parameters"]:,} parameters trained', log_file)
     if args.adapt != 'full':
         add_adapters(backbone, args.adapt, args.lora_rank)  # also freezes the backbone
         if args.train_patch_embed:
@@ -264,7 +279,12 @@ def main():
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)
-    if parameters > MAX_PARAMETERS or trainable > MAX_TRAINABLE:
+    trained_overall = trainable  # with SSL: plus what it trained that stays frozen here, its decoder included
+    if args.ssl_weights:
+        trained_overall += (sum(p.numel() for p in ssl_trained if not p.requires_grad)
+                            + checkpoint['pretraining_only_parameters'])
+        log(f'trained overall, with SSL: {trained_overall:,}', log_file)
+    if parameters > MAX_PARAMETERS or trained_overall > MAX_TRAINABLE:
         log(f'WARNING: over the limits ({MAX_PARAMETERS / 1e6:.0f} M total, {MAX_TRAINABLE / 1e6:.0f} M trainable); '
             'not allowed for a submission', log_file)
 
@@ -299,6 +319,7 @@ def main():
     # Save
     summary = {'run': run_dir.name, 'commit': commit, 'dirty': dirty,
                'args': vars(args), 'parameters': parameters, 'trainable_parameters': trainable,
+               'trained_overall_parameters': trained_overall,
                'train_hours': train_hours, 'peak_gpu_memory_gb': peak_gb,
                'val_history': history, 'val': history[-1], 'test': test}
     (run_dir / 'metrics.json').write_text(json.dumps(summary, indent=2, default=str))

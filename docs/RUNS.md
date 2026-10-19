@@ -33,4 +33,8 @@ sbatch --gres=gpu:l40s:1 --time=10:00:00 train.slurm --backbone swin_b --init pr
 sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-e48
 # YOLOv8l (COCO) with layers 0-5 frozen (39.7 M trainable) + image-class head, AdamW 1e-3, wd 5e-4; 48 ep vs yolov8m-e48; ~2x v8m's compute, so 10 h
 sbatch --time=10:00:00 train.slurm --backbone yolov8l --init pretrained --adapt full --freeze-layers 6 --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8l-f6-e48
+# YOLO11m (COCO, all ~20 M trained) + image-class head on SPPF; same recipe as yolov8m-e48 (AdamW 1e-3, wd 5e-4, 48 ep), vs yolov8m-e48
+sbatch train.slurm --backbone yolo11m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolo11m-e48
+# YOLO11l (COCO, all ~25 M trained, same size as v8m) + image-class head on SPPF; same recipe as yolov8m-e48 (AdamW 1e-3, wd 5e-4, 48 ep), vs yolov8m-e48
+sbatch train.slurm --backbone yolo11l --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolo11l-e48
 ```

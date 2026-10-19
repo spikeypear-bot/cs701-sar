@@ -9,9 +9,10 @@ import torch
 from torch import nn
 from torchvision.ops import box_convert, clip_boxes_to_image
 
-YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolov8l', 'yolo11s', 'yolo11m')  # the choices of --backbone; parameters with
-# COCO's 80 classes (a little fewer at 9): v8s 11.2 M, v8m 25.9 M, v8l 43.7 M, 11s 9.4 M, 11m 20.1 M. v8l is over the
-# 40 M trainable limit unless its first 6 layers are frozen (freeze_layers=6: 39.7 M trainable at 9 classes)
+YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolov8l', 'yolo11s', 'yolo11m', 'yolo11l')  # the choices of --backbone;
+# parameters with COCO's 80 classes (a little fewer at 9): v8s 11.2 M, v8m 25.9 M, v8l 43.7 M, 11s 9.4 M, 11m 20.1 M,
+# 11l 25.3 M. v8l is over the 40 M trainable limit unless its first 6 layers are frozen (freeze_layers=6: 39.7 M
+# trainable at 9 classes)
 WEIGHTS_URL = 'https://github.com/ultralytics/assets/releases/download/v8.3.0/{}.pt'  # COCO detection weights
 
 

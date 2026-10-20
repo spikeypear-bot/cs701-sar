@@ -37,16 +37,17 @@ def pretrained_state(name, in_chans):
     return state
 
 
-def soft_nms(predictions, score_thresh, sigma, max_det):
-    """Gaussian Soft-NMS (Bodla et al., ICCV 2017), per class, multi-label: predictions [B, 4 + classes, anchors]
-    (centre-xywh px, scores) -> per image [n, 6]: xyxy, score, class, as Ultralytics' non_max_suppression. Each
-    (box, class) pair with a score >= score_thresh is a candidate (the SOFT_NMS_CANDIDATES best); max_det times, the
-    best is kept and the scores of the other boxes of its class are multiplied by exp(-IoU^2 / sigma), so an
-    overlapping box is ranked lower instead of dropped. Kept scores below score_thresh are dropped."""
+def soft_nms(predictions, score_thresh, sigma, max_det, nc):
+    """Gaussian Soft-NMS (Bodla et al., ICCV 2017), per class, multi-label: predictions [B, 4 + nc + extra, anchors]
+    (centre-xywh px, nc scores, extra values such as keypoints) -> per image [n, 6 + extra]: xyxy, score, class,
+    extra, as Ultralytics' non_max_suppression. Each (box, class) pair with a score >= score_thresh is a candidate
+    (the SOFT_NMS_CANDIDATES best); max_det times, the best is kept and the scores of the other boxes of its class are
+    multiplied by exp(-IoU^2 / sigma), so an overlapping box is ranked lower instead of dropped. Kept scores below
+    score_thresh are dropped."""
     kept = []
     for p in predictions:
-        p = p.T  # [anchors, 4 + classes]
-        anchors, classes = (p[:, 4:] >= score_thresh).nonzero(as_tuple=True)
+        p = p.T  # [anchors, 4 + nc + extra]
+        anchors, classes = (p[:, 4:4 + nc] >= score_thresh).nonzero(as_tuple=True)
         scores = p[anchors, 4 + classes]
         top = scores.topk(min(len(scores), SOFT_NMS_CANDIDATES)).indices
         anchors, classes, scores = anchors[top], classes[top], scores[top]
@@ -60,10 +61,11 @@ def soft_nms(predictions, score_thresh, sigma, max_det):
             scores = scores * torch.exp(-box_iou(shifted[i, None], shifted)[0] ** 2 / sigma)
             scores[i] = -1  # taken
         if not picked:
-            kept.append(p.new_zeros((0, 6)))
+            kept.append(p.new_zeros((0, 2 + p.shape[1] - nc)))
             continue
         picked, picked_scores = torch.stack(picked), torch.stack(picked_scores)
-        out = torch.cat([boxes[picked], picked_scores[:, None], classes[picked, None].float()], dim=1)
+        out = torch.cat([boxes[picked], picked_scores[:, None], classes[picked, None].float(),
+                         p[anchors[picked], 4 + nc:]], dim=1)
         kept.append(out[picked_scores >= score_thresh])
     return kept
 
@@ -78,14 +80,27 @@ class YOLOMultiTaskModel(nn.Module):
     Training: YOLO's own loss (task-aligned assignment, BCE classes, CIoU + DFL boxes; Ultralytics' gains 7.5, 0.5,
     1.5), per image. Inference: Ultralytics' validation settings, confidence >= 0.001, NMS at IoU 0.7, one box may
     carry several classes; at most 100 detections per image, as COCO mAP counts. nms='soft': Gaussian Soft-NMS
-    (soft_nms, soft_sigma) in place of NMS; train.py always validates with NMS, predict.py can switch."""
+    (soft_nms, soft_sigma) in place of NMS; train.py always validates with NMS, predict.py can switch.
+    centre_keypoint: the network is YOLO's pose model (Pose head: Detect plus a keypoint branch cv4, untrained) with
+    one keypoint per box, its centre, trained by Ultralytics' pose loss (an OKS-style distance loss, 1 - exp(-d^2 /
+    (8 x box area)) at its default sigma 1 for a single keypoint, gain 12), on top of the detection loss; boxes are
+    still assigned and trained by IoU. The keypoint is xy only: every centre is visible, so no visibility score.
+    keypoint_centres (inference, predict.py): each kept box is moved so that its centre is its predicted keypoint, its
+    width and height kept."""
 
     def __init__(self, name, pretrained: bool, in_chans=1, num_classes=9, freeze_layers=0, score_thresh=0.001,
-                 nms_thresh=0.7, detections_per_img=100, quad_fpn=(), nms='hard', soft_sigma=0.5):
+                 nms_thresh=0.7, detections_per_img=100, quad_fpn=(), nms='hard', soft_sigma=0.5,
+                 centre_keypoint=False, keypoint_centres=False):
         super().__init__()
-        from ultralytics.nn.tasks import DetectionModel
-        self.backbone = DetectionModel(f'{name}.yaml', ch=in_chans, nc=num_classes, verbose=False)
-        self.backbone.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)  # the loss gains v8DetectionLoss reads
+        from ultralytics.nn.tasks import DetectionModel, PoseModel
+        self.centre_keypoint = centre_keypoint
+        if centre_keypoint:  # the COCO detection weights below fit it too: it differs only by the Pose head's cv4
+            self.backbone = PoseModel(f'{name}-pose.yaml', ch=in_chans, nc=num_classes, data_kpt_shape=(1, 2),
+                                      verbose=False)
+        else:
+            self.backbone = DetectionModel(f'{name}.yaml', ch=in_chans, nc=num_classes, verbose=False)
+        # the loss gains v8DetectionLoss and v8PoseLoss read: Ultralytics' defaults
+        self.backbone.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, pose=12.0, kobj=1.0)
         self.transferred = 0  # pretrained tensors loaded, for the log
         if pretrained:
             own = self.backbone.state_dict()
@@ -100,8 +115,9 @@ class YOLOMultiTaskModel(nn.Module):
         self.cls_head = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, num_classes))
         self.quad_fpn = QuadFPN(layers, quad_fpn) if quad_fpn else None
         self.score_thresh, self.nms_thresh, self.detections_per_img = score_thresh, nms_thresh, detections_per_img
-        self.nms, self.soft_sigma = nms, soft_sigma
-        self.criterion = None  # v8DetectionLoss, made on the first training step: it takes the model's device then
+        self.nms, self.soft_sigma, self.keypoint_centres = nms, soft_sigma, keypoint_centres
+        self.criterion = None  # v8DetectionLoss or v8PoseLoss, made on the first training step: it takes the model's
+        # device then
 
     def features(self, x):
         """Every layer but the detection head, as Ultralytics' _predict_once -> (the outputs of all layers, the SPPF
@@ -118,51 +134,68 @@ class YOLOMultiTaskModel(nn.Module):
             outputs.append(x)
         return outputs, (plain or outputs)[self.sppf]
 
-    def yolo_losses(self, raw, targets, images):
-        """Ultralytics' loss on the head's raw maps; their targets are class 0..8 and normalized centre-xywh boxes.
-        Their loss is summed over the batch, so it is divided by the batch size here, as the other detectors' losses
-        are per image."""
+    def yolo_losses(self, raw, targets, images, keypoints=None):
+        """Ultralytics' loss on the head's raw maps (and raw keypoints, with centre_keypoint); their targets are class
+        0..8, normalized centre-xywh boxes (and the boxes' centres as keypoints). Their loss is summed over the batch,
+        so it is divided by the batch size here, as the other detectors' losses are per image."""
         if self.criterion is None:
-            from ultralytics.utils.loss import v8DetectionLoss
-            self.criterion = v8DetectionLoss(self.backbone)
+            from ultralytics.utils.loss import v8DetectionLoss, v8PoseLoss
+            self.criterion = (v8PoseLoss if self.centre_keypoint else v8DetectionLoss)(self.backbone)
         h, w = images.shape[-2:]
         batch = {'batch_idx': torch.cat([torch.full((len(t['boxes']),), i, device=images.device, dtype=torch.float32)
                                          for i, t in enumerate(targets)]),
                  'cls': torch.cat([t['labels'] - 1 for t in targets]).float(),
                  'bboxes': torch.cat([box_convert(t['boxes'], 'xyxy', 'cxcywh') for t in targets])
                            / torch.tensor([w, h, w, h], device=images.device, dtype=torch.float32)}
+        if self.centre_keypoint:
+            batch['keypoints'] = batch['bboxes'][:, None, :2]  # [boxes, 1 keypoint, xy], normalized as the boxes
+            loss, _ = self.criterion((raw, keypoints), batch)  # [box, keypoint, keypoint visibility (0), cls, dfl]
+            loss = loss / len(images)
+            return {'loss_yolo_box': loss[0], 'loss_yolo_cls': loss[3], 'loss_yolo_dfl': loss[4],
+                    'loss_yolo_kpt': loss[1]}
         loss, _ = self.criterion(raw, batch)  # [box, cls, dfl], times the batch size
         loss = loss / len(images)
         return {'loss_yolo_box': loss[0], 'loss_yolo_cls': loss[1], 'loss_yolo_dfl': loss[2]}
 
-    def postprocess(self, raw, size):
-        """The head's raw maps -> per-image {'boxes' XYXY on the input, 'labels' 1..9, 'scores'}, as torchvision's."""
+    def postprocess(self, raw, size, keypoints=None):
+        """The head's raw maps (and raw keypoints, with centre_keypoint) -> per-image {'boxes' XYXY on the input,
+        'labels' 1..9, 'scores'}, as torchvision's."""
         from ultralytics.utils.ops import non_max_suppression
-        predictions = self.backbone.model[-1]._inference(raw)  # [B, 4 + classes, anchors]: centre-xywh px, scores
+        head = self.backbone.model[-1]
+        predictions = head._inference(raw)  # [B, 4 + classes, anchors]: centre-xywh px, scores
+        if keypoints is not None:  # the predicted centres [B, 2, anchors] in px (after _inference: it sets the anchors)
+            predictions = torch.cat([predictions, head.kpts_decode(len(predictions), keypoints)], dim=1)
         if self.nms == 'soft':
-            kept = soft_nms(predictions, self.score_thresh, self.soft_sigma, self.detections_per_img)
+            kept = soft_nms(predictions, self.score_thresh, self.soft_sigma, self.detections_per_img, head.nc)
         else:
             # max_time_img: Ultralytics stops NMS after 0.05 s per image and leaves the remaining images empty, which
             # an early, unsure model can hit at confidence 0.001; here no time limit
             kept = non_max_suppression(predictions, self.score_thresh, self.nms_thresh, multi_label=True,
-                                       max_det=self.detections_per_img, max_time_img=1e6)  # [n, 6]: xyxy score class
+                                       max_det=self.detections_per_img, nc=head.nc,
+                                       max_time_img=1e6)  # [n, 6 (+ 2)]: xyxy score class (keypoint xy)
+        if self.keypoint_centres:  # each box moved onto its predicted centre, same width and height
+            kept = [torch.cat([d[:, 6:8] - (d[:, 2:4] - d[:, :2]) / 2, d[:, 6:8] + (d[:, 2:4] - d[:, :2]) / 2,
+                               d[:, 4:6]], dim=1) for d in kept]
         return [{'boxes': clip_boxes_to_image(d[:, :4], size), 'scores': d[:, 4], 'labels': d[:, 5].long() + 1}
                 for d in kept]
 
     def forward(self, images, targets=None):
         """As MultiTaskModel.forward: images, targets (training only) -> (logits [B, num_classes], per-image detections
-        (eval mode), {'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl'} (training mode)).
+        (eval mode), {'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl'(, 'loss_yolo_kpt')} (training mode)).
         Precision rule as model.py's: the head's convs run in the caller's bf16, as RetinaNet's, and its raw maps go to
         fp32 before boxes are decoded, so no coordinate snaps to bf16's 2 px grid near 512."""
         outputs, sppf = self.features(images)
         logits = self.cls_head(sppf.mean(dim=(2, 3)))
-        head = self.backbone.model[-1]  # Detect, on the P3, P4, P5 maps of the neck (strides 8, 16, 32)
+        head = self.backbone.model[-1]  # Detect (Pose), on the P3, P4, P5 maps of the neck (strides 8, 16, 32)
         maps = [outputs[j] for j in head.f]
         if self.quad_fpn is not None:
             maps = self.quad_fpn.head_inputs(maps)
         raw = [torch.cat((head.cv2[i](x), head.cv3[i](x)), 1) for i, x in enumerate(maps)]
+        keypoints = (torch.cat([head.cv4[i](x).flatten(2) for i, x in enumerate(maps)], dim=2)  # [B, 2, anchors]
+                     if self.centre_keypoint else None)
         with torch.autocast(images.device.type, enabled=False):
             raw = [r.float() for r in raw]
+            keypoints = keypoints.float() if keypoints is not None else None
             if self.training:
-                return logits, [], self.yolo_losses(raw, targets, images)
-            return logits, self.postprocess(raw, tuple(images.shape[-2:])), {}
+                return logits, [], self.yolo_losses(raw, targets, images, keypoints)
+            return logits, self.postprocess(raw, tuple(images.shape[-2:]), keypoints), {}

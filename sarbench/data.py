@@ -1,6 +1,7 @@
 """The course data in TA Zichen's folder layout (see README): every image has one class label and >= 1 box.
 Loads images and boxes at a fixed input size and maps predicted boxes back to original pixels. Options: input
-channels from SAR filters (input_channels), and two training augmentations, BoxPaste and 90-degree rotations."""
+channels from SAR filters (input_channels), and three training augmentations, BoxPaste, 90-degree rotations and
+random zoom-in crops."""
 import csv
 import json
 import random
@@ -9,15 +10,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import tv_tensors
-from torchvision.ops import box_convert
+from torchvision.ops import box_area, box_convert
 from torchvision.transforms import v2
 
 # Mean and std of all pixels of the 9,392 train images, read as gray, resized to
 # 512 x 512 and scaled to [0, 1] (computed once).
 MEAN, STD = 0.2526, 0.2133
+CROP_MIN_VISIBLE = 0.5  # random_crop keeps a box it cuts, clipped, if at least this share of its area is inside
 CHANNELS = ('raw', 'nlm', 'cv', 'gre', 'ml')  # the choices of input_channels
 ML_LOOKS = 3  # 'ml' averages ML_LOOKS x ML_LOOKS pixels; odd, so the window is centred and boxes stay aligned
 
@@ -156,14 +159,40 @@ def rot90(image, boxes, k):
     return torch.rot90(image, k, dims=(-2, -1)), boxes
 
 
+def random_crop(image, boxes, min_side):
+    """A random square crop of a square image [C, S, S] with XYXY boxes, its side min_side..1 x S, resized back to
+    S x S (bilinear): a zoom-in of 1 to 1 / min_side, so small objects are seen bigger. The crop holds one box picked
+    at random whole (the crop grows to fit it if it is bigger), so every image keeps a box of its class; the other
+    boxes are clipped to the crop and dropped if less than CROP_MIN_VISIBLE of their area is inside.
+    -> (image [C, S, S], boxes XYXY [kept boxes, 4], kept: bool [boxes])."""
+    size = image.shape[-1]
+    picked = int(torch.randint(len(boxes), ()))
+    x1, y1, x2, y2 = boxes[picked].tolist()
+    side = min(int(np.ceil(max(size * float(torch.empty(()).uniform_(min_side, 1)), x2 - x1, y2 - y1))), size)
+    corner = []
+    for low, high in ((x1, x2), (y1, y2)):  # the crop's left (top) edge: the picked box inside, the crop in the image
+        first, last = max(0.0, high - side), min(low, size - side)
+        corner.append(min(int(first + float(torch.rand(())) * max(last - first, 0.0)), size - side))
+    left, top = corner
+    image = F.interpolate(image[None, :, top:top + side, left:left + side], size=(size, size), mode='bilinear',
+                          align_corners=False)[0]
+    shifted = boxes - torch.tensor([left, top, left, top], dtype=boxes.dtype)
+    clipped = shifted.clamp(0, side)
+    inside, whole = box_area(clipped), box_area(shifted)
+    kept = (inside > 0) & (inside >= CROP_MIN_VISIBLE * whole)
+    kept[picked] = True  # whole, up to the rounding of the crop to pixels
+    return image, clipped[kept] * (size / side), kept
+
+
 class SARMultiTask(Dataset):
     """The images of classification/{split}.csv with their boxes from detection/instances_{split}.json.
     An item is (image [C, size, size], label 0..8, target), target = {'boxes': XYXY on the resized
     image, 'labels': 1..9, 'image_id': COCO id, 'orig_size': (h, w)}. C = len(channels), see input_channels.
-    Training only: boxpaste = BoxPaste options {prob, max_pastes, max_size, classes (names)}, rot90."""
+    Training only: boxpaste = BoxPaste options {prob, max_pastes, max_size, classes (names)}, rot90, and random_crop
+    with probability crop_prob (crop sides crop_min_side..1 of the image)."""
 
     def __init__(self, root, split, train=False, size=512, limit=None, channels=('raw',), stats=None,
-                 boxpaste=None, rot90=False):
+                 boxpaste=None, rot90=False, crop_prob=0.0, crop_min_side=0.5):
         self.root = Path(root)
         with open(self.root / 'classification' / f'{split}.csv') as f:
             self.rows = list(csv.DictReader(f))[:limit]
@@ -185,6 +214,7 @@ class SARMultiTask(Dataset):
                           for ann in self.annotations[info['id']] if ann['category_id'] in classes]
             self.boxpaste = BoxPaste(items, boxpaste['prob'], boxpaste['max_pastes'], boxpaste['max_size'])
         self.rot90 = train and rot90
+        self.crop_prob, self.crop_min_side = (crop_prob if train else 0.0), crop_min_side
         flips = [v2.RandomHorizontalFlip(), v2.RandomVerticalFlip()] if train else []
         self.transform = v2.Compose([
             v2.ToImage(),
@@ -211,10 +241,14 @@ class SARMultiTask(Dataset):
         boxes = tv_tensors.BoundingBoxes(xywh, format='XYWH', canvas_size=orig_size,
                                          dtype=torch.float32)  # integer boxes would be truncated by Resize
         image, boxes = self.transform(input_channels(gray, self.channels), boxes)
+        labels = torch.tensor(labels)
+        if self.crop_prob and float(torch.rand(())) < self.crop_prob:  # after the resize: crops are of the model input
+            image, cropped, kept = random_crop(image, boxes.as_subclass(torch.Tensor), self.crop_min_side)
+            boxes, labels = tv_tensors.wrap(cropped, like=boxes), labels[kept]
         if self.rot90:
             image, rotated = rot90(image, boxes, int(torch.randint(4, ())))
             boxes = tv_tensors.wrap(rotated, like=boxes)
-        target = {'boxes': boxes, 'labels': torch.tensor(labels), 'image_id': info['id'], 'orig_size': orig_size}
+        target = {'boxes': boxes, 'labels': labels, 'image_id': info['id'], 'orig_size': orig_size}
         return image, int(row['label']), target
 
 

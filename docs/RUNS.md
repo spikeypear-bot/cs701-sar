@@ -45,4 +45,8 @@ sbatch train.slurm --backbone yolo11m --init pretrained --adapt full --lr 1e-3 -
 sbatch train.slurm --backbone yolo11s --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 60 --name yolo11s-e60
 # YOLOv8m + Quad-FPN in the neck (all 4 parts: deformable convs, CARAFE, space attention, balanced pyramid + non-local; +11.35 M, 37.2 M trainable, each starts as the identity); same recipe as yolov8m-e48, vs yolov8m-e48
 sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --quad-fpn all --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-quadfpn-e48
+# YOLOv8m + centre keypoint (pose model, 1 keypoint = box centre, Ultralytics' pose loss, gain 12; +0.56 M); same recipe as yolov8m-e48, vs yolov8m-e48; then predict.py with and without --keypoint-centres
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --centre-keypoint --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-ckpt-e48
+# YOLOv8m + random zoom-in crops (half the training images: a square of 50-100 % of the side around one box, resized to 512); same recipe as yolov8m-e48, vs yolov8m-e48
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --crop-prob 0.5 --crop-min-side 0.5 --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-crop-e48
 ```

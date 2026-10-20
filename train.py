@@ -27,7 +27,7 @@ REF_F1, REF_MAP = 0.9399, 0.2541
 # Cross-entropy of the image class, then the detector's losses: Faster R-CNN's (RPN, then RoI heads), RetinaNet's or
 # YOLO's (sarbench/yolo.py)
 MAIN_LOSSES = ('classification', 'loss_objectness', 'loss_rpn_box_reg', 'loss_classifier', 'loss_box_reg',
-               'loss_focal', 'loss_retina_box_reg', 'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl')
+               'loss_focal', 'loss_retina_box_reg', 'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl', 'loss_yolo_kpt')
 
 
 def parse_blocks(spec):
@@ -111,9 +111,20 @@ def parse_args():
                         'the backbone maps), ca (CARAFE upsampling), pa (space attention before the bottom-up '
                         'down-sampling), bs (balanced pyramid with a non-local block), e.g. all or de,ca; each starts '
                         'as the identity; yolov8m all: 11.35 M parameters (default: off); see sarbench/quadfpn.py')
+    p.add_argument('--centre-keypoint', action='store_true',
+                   help='YOLO only: train its pose model with one keypoint per box, the box centre (Ultralytics\' pose '
+                        'loss, a distance loss, on top of the detection loss; loss_yolo_kpt); predict.py '
+                        '--keypoint-centres then moves each box onto its predicted centre; see sarbench/yolo.py')
     p.add_argument('--unfreeze-lr', type=float, default=2e-5,
                    help='for the pretrained weights of --unfreeze-blocks (default: 2e-5, as for full fine-tuning)')
     p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
+    p.add_argument('--crop-prob', type=float, default=0.0,
+                   help='chance that a training image is a random zoom-in crop: a square of --crop-min-side..1 of '
+                        'the side, holding one of its boxes whole, resized back to the input size; boxes cut by it '
+                        'are clipped, or dropped if less than half inside (default: 0 = off); see sarbench/data.py '
+                        'random_crop')
+    p.add_argument('--crop-min-side', type=float, default=0.5,
+                   help='smallest crop side, as a share of the image side: zooms up to 1 / this (default: 0.5)')
     p.add_argument('--boxpaste-prob', type=float, default=0.0,
                    help='chance that a training image gets same-class BoxPaste objects (default: 0 = off)')
     p.add_argument('--boxpaste-max', type=int, default=3, help='at most this many pasted objects per image')
@@ -152,8 +163,12 @@ def parse_args():
         p.error('--fgfm-levels is for the Swin backbones (an FPN over 4 backbone maps)')
     if not set(args.fgfm_levels) <= {0, 1, 2, 3}:
         p.error('--fgfm-levels takes levels 0 to 3')
+    if not 0 <= args.crop_prob <= 1 or not 0 < args.crop_min_side <= 1:
+        p.error('--crop-prob takes 0 to 1, --crop-min-side more than 0 to 1')
     if args.quad_fpn and args.backbone not in YOLO_MODELS:
         p.error('--quad-fpn is for the YOLO backbones')
+    if args.centre_keypoint and args.backbone not in YOLO_MODELS:
+        p.error('--centre-keypoint is for the YOLO backbones')
     if not set(args.quad_fpn) <= set(QUAD_FPN_PARTS):
         p.error(f'--quad-fpn takes all or parts from {QUAD_FPN_PARTS}')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):
@@ -189,7 +204,7 @@ def make_loader(args, split):
                 'classes': args.boxpaste_classes.split(',')} if args.boxpaste_prob > 0 else None
     dataset = SARMultiTask(args.data, split, train=train, size=args.image_size, limit=args.limit,
                            channels=args.input_channels.split(','), stats=args.channel_stats, boxpaste=boxpaste,
-                           rot90=args.rot90)
+                           rot90=args.rot90, crop_prob=args.crop_prob, crop_min_side=args.crop_min_side)
     return DataLoader(dataset, args.batch_size, shuffle=train, num_workers=args.workers, collate_fn=collate,
                       persistent_workers=train and args.workers > 0)  # training workers live across epochs
 
@@ -299,7 +314,8 @@ def main():
     if args.backbone in YOLO_MODELS:  # a whole detector, every parameter trained (sarbench/yolo.py)
         model = YOLOMultiTaskModel(args.backbone, pretrained=args.init == 'pretrained',
                                    in_chans=len(args.input_channels.split(',')),
-                                   freeze_layers=args.freeze_layers, quad_fpn=args.quad_fpn).cuda()
+                                   freeze_layers=args.freeze_layers, quad_fpn=args.quad_fpn,
+                                   centre_keypoint=args.centre_keypoint).cuda()
         log(f'{args.backbone}: {model.transferred} tensors from the COCO weights', log_file)
     else:
         backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',

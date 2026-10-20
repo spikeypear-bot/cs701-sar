@@ -83,11 +83,34 @@ def test_soft_nms_ranks_an_overlapping_box_of_the_same_class_lower_instead_of_dr
     # 3 anchors, 2 classes: boxes 0 and 1 overlap at IoU 360 / 440 (class 0); box 2 is box 1 again, but class 1
     boxes = torch.tensor([[50., 50, 20, 20], [52, 50, 20, 20], [52, 50, 20, 20]])  # centre-xywh
     scores = torch.tensor([[0.9, 0.0], [0.8, 0.0], [0.0, 0.7]])
-    kept = soft_nms(torch.cat([boxes, scores], dim=1).T[None], score_thresh=0.001, sigma=0.5, max_det=100)[0]
+    kept = soft_nms(torch.cat([boxes, scores], dim=1).T[None], score_thresh=0.001, sigma=0.5, max_det=100, nc=2)[0]
     assert kept[:, 5].tolist() == [0, 1, 0]
     assert torch.allclose(kept[:, 4], torch.tensor([0.9, 0.7, 0.8 * math.exp(-(360 / 440) ** 2 / 0.5)]))
     assert torch.allclose(kept[0, :4], torch.tensor([40., 40, 60, 60]))
-    assert soft_nms(torch.cat([boxes, scores], dim=1).T[None], 0.001, 0.5, max_det=2)[0].shape == (2, 6)
+    assert soft_nms(torch.cat([boxes, scores], dim=1).T[None], 0.001, 0.5, max_det=2, nc=2)[0].shape == (2, 6)
+    keypoints = torch.tensor([[51., 49], [53, 50], [52, 51]])  # extra columns are carried along
+    kept = soft_nms(torch.cat([boxes, scores, keypoints], dim=1).T[None], 0.001, 0.5, max_det=100, nc=2)[0]
+    assert kept[:, 6:].tolist() == [[51, 49], [52, 51], [53, 50]]
+
+
+def test_centre_keypoint_model_trains_on_box_centres_and_can_move_boxes_onto_them():
+    model = YOLOMultiTaskModel('yolov8m', pretrained=True, centre_keypoint=True).cuda().train()
+    own = model.backbone.state_dict()
+    # untrained: the class convs (9 classes) and the keypoint branch cv4
+    assert all(k.startswith('model.22.cv4.') or k.startswith('model.22.cv3.') for k in own if k not in
+               {k for k, v in pretrained_state('yolov8m', in_chans=1).items() if k in own and v.shape == own[k].shape})
+    images, _, targets = first_train_images(2)
+    _, _, losses = forward(model, images, targets)
+    assert set(losses) == {'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl', 'loss_yolo_kpt'}
+    assert all(loss.dtype == torch.float32 and loss.isfinite() and loss > 0 for loss in losses.values())
+    model.eval()
+    with torch.no_grad():
+        plain = forward(model, images)[1]
+        model.keypoint_centres = True
+        moved = forward(model, images)[1]
+    for a, b in zip(plain, moved):  # same detections, other places (sizes equal unless clipped)
+        assert torch.allclose(a['scores'], b['scores']) and torch.equal(a['labels'], b['labels'])
+        assert not torch.equal(a['boxes'], b['boxes'])
 
 
 def test_predict_rebuilds_the_model_from_a_run_folder(tmp_path):

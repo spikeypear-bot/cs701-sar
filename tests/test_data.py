@@ -10,7 +10,8 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import tv_tensors
 
-from sarbench.data import MEAN, STD, BoxPaste, SARMultiTask, collate, input_channels, rot90, to_original_xywh
+from sarbench.data import (MEAN, STD, BoxPaste, SARMultiTask, collate, input_channels, random_crop, rot90,
+                           to_original_xywh)
 from sarbench.metrics import detection_metrics
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
@@ -75,6 +76,25 @@ def test_rot90_moves_boxes_with_pixels():
     for k in range(4):
         out, out_box = rot90(image, box, k)
         assert torch.equal(bright_box(out), out_box[0])
+
+
+def test_random_crop_zooms_in_and_moves_the_boxes_with_the_pixels():
+    image = torch.zeros(1, 512, 512)
+    image[:, 200:240, 100:180] = 1  # box 0, bright
+    boxes = torch.tensor([[100., 200., 180., 240.], [0., 0., 8., 8.], [490., 490., 512., 512.]])
+    picked_far_box = False
+    for seed in range(50):
+        torch.manual_seed(seed)
+        out, out_boxes, kept = random_crop(image, boxes, min_side=0.5)
+        assert out.shape == image.shape and kept.any() and len(out_boxes) == kept.sum()
+        assert out_boxes.min() >= 0 and out_boxes.max() <= 512
+        if kept[0]:  # the bright box, where its pixels went (zoomed: bilinear edges, so 1 px of slack per side)
+            x1, y1, x2, y2 = out_boxes[0].tolist()
+            assert out[0, int(y1) + 2:int(y2) - 2, int(x1) + 2:int(x2) - 2].min() > 0.5
+            if (out_boxes[0] > 0).all() and (out_boxes[0] < 512).all():  # whole: zoomed in, never out
+                assert x2 - x1 >= 80 - 1e-3 and y2 - y1 >= 40 - 1e-3
+        picked_far_box |= not kept[0]
+    assert picked_far_box  # the crop sometimes holds a corner box and leaves box 0 out
 
 
 def test_boxpaste_adds_free_boxes_over_the_pasted_objects(tmp_path):

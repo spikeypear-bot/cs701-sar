@@ -37,12 +37,15 @@ def parse_args():
     p.add_argument('--soft-sigma', type=float, help='YOLO, soft NMS: scores times exp(-IoU^2 / sigma) (default: 0.5, '
                                                     'as Bodla et al.)')
     p.add_argument('--score-thresh', type=float, help='YOLO: lowest score kept (default: 0.001)')
+    p.add_argument('--keypoint-centres', action='store_true',
+                   help='YOLO runs with --centre-keypoint only: move each box onto its predicted centre keypoint')
     args = p.parse_args()
     args.root = args.root or args.images.parent
     # the post-processing options given, set on the model; they go in the default zip name, so that the zip of the
     # run's own settings is not overwritten
     args.postprocess = {k: v for k, v in (('nms', args.nms), ('nms_thresh', args.nms_thresh),
-                                          ('soft_sigma', args.soft_sigma), ('score_thresh', args.score_thresh))
+                                          ('soft_sigma', args.soft_sigma), ('score_thresh', args.score_thresh),
+                                          ('keypoint_centres', args.keypoint_centres or None))
                         if v is not None}
     suffix = ''.join(f'_{k}-{v}' for k, v in args.postprocess.items())
     args.out = args.out or args.run / f'submission_{args.images.parent.name}{suffix}.zip'
@@ -57,7 +60,8 @@ def load_model(run):
     if options['backbone'] in YOLO_MODELS:  # the whole detector, rebuilt from its Ultralytics config
         model = YOLOMultiTaskModel(options['backbone'], pretrained=False,
                                    in_chans=len(options.get('input_channels', 'raw').split(',')),
-                                   quad_fpn=options.get('quad_fpn', []))  # runs before --quad-fpn: none
+                                   quad_fpn=options.get('quad_fpn', []),  # runs before --quad-fpn: none
+                                   centre_keypoint=options.get('centre_keypoint', False))
         model.load_state_dict(state)
         return model.cuda().eval()
     backbone = build_backbone(options['backbone'], pretrained=False,  # every weight comes from model.pt
@@ -112,7 +116,9 @@ def main():
     loader = DataLoader(dataset, args.batch_size, num_workers=args.workers, collate_fn=collate_images)
     model = load_model(args.run)
     if args.postprocess and not isinstance(model, YOLOMultiTaskModel):
-        raise SystemExit('--nms, --nms-thresh, --soft-sigma and --score-thresh are for YOLO runs')
+        raise SystemExit('--nms, --nms-thresh, --soft-sigma, --score-thresh and --keypoint-centres are for YOLO runs')
+    if args.keypoint_centres and not model.centre_keypoint:
+        raise SystemExit('--keypoint-centres needs a run trained with --centre-keypoint')
     for name, value in args.postprocess.items():
         setattr(model, name, value)
     preds = predict(model, loader)

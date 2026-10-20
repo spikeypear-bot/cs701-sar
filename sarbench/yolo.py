@@ -69,15 +69,19 @@ class YOLOMultiTaskModel(nn.Module):
         self.criterion = None  # v8DetectionLoss, made on the first training step: it takes the model's device then
 
     def features(self, x):
-        """Every layer but the detection head, as Ultralytics' _predict_once -> the outputs of all layers (with
-        Quad-FPN's parts in the neck, if on)."""
-        outputs = []
+        """Every layer but the detection head, as Ultralytics' _predict_once -> (the outputs of all layers, the SPPF
+        map for the image-class head). With Quad-FPN, its parts run in the neck, which reads the backbone maps through
+        its deformable convs; the backbone and the image-class head see the plain maps."""
+        outputs, plain = [], None
         for m in self.backbone.model[:-1]:
+            if self.quad_fpn is not None and m.i == self.quad_fpn.neck_start:
+                plain, outputs = outputs, self.quad_fpn.lateral_maps(outputs)
+                x = outputs[-1]  # the first Upsample's input
             if m.f != -1:  # input from earlier layers (Concat), not only the previous one
                 x = outputs[m.f] if isinstance(m.f, int) else [x if j == -1 else outputs[j] for j in m.f]
             x = self.quad_fpn.layer(m, x) if self.quad_fpn is not None else m(x)
             outputs.append(x)
-        return outputs
+        return outputs, (plain or outputs)[self.sppf]
 
     def yolo_losses(self, raw, targets, images):
         """Ultralytics' loss on the head's raw maps; their targets are class 0..8 and normalized centre-xywh boxes.
@@ -112,8 +116,8 @@ class YOLOMultiTaskModel(nn.Module):
         (eval mode), {'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl'} (training mode)).
         Precision rule as model.py's: the head's convs run in the caller's bf16, as RetinaNet's, and its raw maps go to
         fp32 before boxes are decoded, so no coordinate snaps to bf16's 2 px grid near 512."""
-        outputs = self.features(images)
-        logits = self.cls_head(outputs[self.sppf].mean(dim=(2, 3)))
+        outputs, sppf = self.features(images)
+        logits = self.cls_head(sppf.mean(dim=(2, 3)))
         head = self.backbone.model[-1]  # Detect, on the P3, P4, P5 maps of the neck (strides 8, 16, 32)
         maps = [outputs[j] for j in head.f]
         if self.quad_fpn is not None:

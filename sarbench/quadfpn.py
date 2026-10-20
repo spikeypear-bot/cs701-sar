@@ -7,15 +7,21 @@ chains four FPNs after a ResNet-50 (five levels, 256 channels, Faster R-CNN in M
 - pa: PA-SA-FPN, a bottom-up path (PANet) whose maps go through a space attention before each down-sampling:
   channel mean and max -> space encoder -> sigmoid -> times the map;
 - bs: BS-GA-FPN, Libra R-CNN's balanced pyramid: every level resized to the middle one (max pooling or nearest
-  upsampling), averaged, refined by a non-local block (embedded Gaussian, no scaling, Wang et al. 2018), resized back.
+  upsampling), averaged, refined by a non-local block (embedded Gaussian, Wang et al. 2018), resized back.
 
 YOLOv8/11's neck is already a PANet (top-down, then bottom-up, C2f/C3k2 fusions), so the four parts go into it rather
 than replacing it, and its COCO weights are kept:
-- de after the backbone maps the neck reads (v8: layers 4, 6, 9; 11: 4, 6, 10; on v8 the image-class head, which
-  reads layer 9, sees that map too), ca in place of the neck's two nn.Upsample, pa on the inputs of its two stride-2
-  convs, bs on the three maps the Detect head reads;
-- every part starts as the identity (zero BatchNorm scale, gate or last conv), so step 0 is the pretrained YOLO; de and
-  bs are added to their input, as residuals (Libra adds its rescaled maps back too);
+- de on the backbone maps as the neck reads them (v8: layers 4, 6, 9; 11: 4, 6, 10): the backbone itself and the
+  image-class head see the plain maps; ca in place of the neck's two nn.Upsample, pa on the inputs of its two
+  stride-2 convs, bs on the three maps the Detect head reads;
+- every part is a residual branch behind a gate that starts at 0 (a BatchNorm scale per channel for de, a scalar for
+  the others), so step 0 is the pretrained YOLO. Not zero-initialised convs: under Adam every weight moves by about
+  the learning rate per step whatever its gradient, so a zero-initialised conv with n inputs can grow its output by
+  about n x lr x the input per step (1e-3 x 256 inputs: a quarter of the input per step), the likely cause of the
+  first run's collapse (yolov8m, all parts: val mAP 0 from epoch 4 on); a scalar gate grows by at most lr per step;
+- de's offsets are its conv's output x 0.1 (as MMDetection's 0.1 learning rate for offsets): unscaled, they too grow
+  by n x lr pixels per step;
+- the non-local block scales its similarities by 1 / sqrt(channels), as MMCV's default (Libra R-CNN turns it off);
 - CARAFE amplifies to a fixed 2048 channels (the paper's 8 x 256) rather than 8 x the map's 384-576: 2-5 M parameters
   less per upsampler, which keeps yolov8m under 40 M trainable;
 - the paper does not give its space encoder: here 7 x 7 conv to 16 channels, ReLU, 7 x 7 conv to 1;
@@ -36,11 +42,13 @@ def width(layer):
 
 
 class DeformableConv(nn.Module):
-    """DE-CO: x + SiLU(BN(deformable 3 x 3 conv(x))), YOLO's Conv block with a deformable conv. Offsets from a 3 x 3
-    conv, zero at the start (a plain 3 x 3 conv); the BN scale starts at 0, so the block starts as the identity."""
+    """DE-CO: x + SiLU(BN(deformable 3 x 3 conv(x))), YOLO's Conv block with a deformable conv. Offsets: 0.1 x a
+    3 x 3 conv, zero at the start (a plain 3 x 3 conv); the BN scale starts at 0, so the block starts as the
+    identity."""
 
-    def __init__(self, channels, kernel=3):
+    def __init__(self, channels, kernel=3, offset_scale=0.1):
         super().__init__()
+        self.offset_scale = offset_scale
         self.offset = nn.Conv2d(channels, 2 * kernel * kernel, kernel, padding=kernel // 2)
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
@@ -50,7 +58,7 @@ class DeformableConv(nn.Module):
 
     def forward(self, x):
         # under autocast, torchvision runs deform_conv2d in fp32 and returns x's dtype
-        return x + F.silu(self.bn(self.conv(x, self.offset(x))))
+        return x + F.silu(self.bn(self.conv(x, self.offset_scale * self.offset(x))))
 
 
 class CARAFE(nn.Module):
@@ -77,52 +85,48 @@ class CARAFE(nn.Module):
 
 
 class SpaceAttention(nn.Module):
-    """PA-SA: x times 2 sigmoid(space encoder([channel mean, channel max])), a weight per pixel; the encoder's last
-    conv starts at 0, so the weights start at 1."""
+    """PA-SA: x times 1 + gate (2 sigmoid(space encoder([channel mean, channel max])) - 1), a weight per pixel; at
+    gate 1, the paper's sigmoid weights (times 2); the gate starts at 0, so the weights start at 1."""
 
     def __init__(self, hidden=16, kernel=7):
         super().__init__()
         self.encode = nn.Sequential(nn.Conv2d(2, hidden, kernel, padding=kernel // 2), nn.ReLU(),
                                     nn.Conv2d(hidden, 1, kernel, padding=kernel // 2))
-        nn.init.zeros_(self.encode[-1].weight)
-        nn.init.zeros_(self.encode[-1].bias)
+        self.gate = nn.Parameter(torch.zeros(()))
 
     def forward(self, x):
         pooled = torch.cat([x.mean(dim=1, keepdim=True), x.amax(dim=1, keepdim=True)], dim=1)
-        return x * 2 * torch.sigmoid(self.encode(pooled))
+        return x * (1 + self.gate.to(x.dtype) * (2 * torch.sigmoid(self.encode(pooled)) - 1))
 
 
 class NonLocal(nn.Module):
-    """GA refinement: x + W_O softmax(theta(x)^T phi(x)) g(x) over all positions, 1 x 1 convs, no reduction or
-    scaling (as Libra R-CNN's NonLocal2d); W_O starts at 0."""
+    """GA refinement: x + gate W_O softmax(theta(x)^T phi(x) / sqrt(channels)) g(x) over all positions, 1 x 1 convs,
+    no channel reduction (as Libra R-CNN's NonLocal2d); the gate starts at 0."""
 
     def __init__(self, channels):
         super().__init__()
         self.theta, self.phi, self.g = (nn.Conv2d(channels, channels, 1) for _ in range(3))
         self.out = nn.Conv2d(channels, channels, 1)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
+        self.gate = nn.Parameter(torch.zeros(()))
 
     def forward(self, x):
         b, c, h, w = x.shape
         q, k, v = (conv(x).flatten(2).transpose(1, 2) for conv in (self.theta, self.phi, self.g))  # [B, HW, C]
-        o = F.scaled_dot_product_attention(q, k, v, scale=1.0)
-        return x + self.out(o.transpose(1, 2).reshape(b, c, h, w))
+        o = F.scaled_dot_product_attention(q, k, v)  # scale 1 / sqrt(channels)
+        return x + self.gate.to(x.dtype) * self.out(o.transpose(1, 2).reshape(b, c, h, w))
 
 
 class BalancedPyramid(nn.Module):
     """BS-GA: the levels (largest first) -> 1 x 1 convs to `hidden` channels -> resized to the middle level (max pooling
     the larger ones, nearest upsampling the smaller) -> mean -> non-local block -> resized back to each level -> 1 x 1
-    convs to its channels, starting at 0 -> added to the level."""
+    convs to its channels -> times the level's gate, which starts at 0 -> added to the level."""
 
     def __init__(self, channels, hidden=256):
         super().__init__()
         self.into = nn.ModuleList(nn.Conv2d(c, hidden, 1) for c in channels)
         self.refine = NonLocal(hidden)
         self.back = nn.ModuleList(nn.Conv2d(hidden, c, 1) for c in channels)
-        for conv in self.back:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
+        self.gates = nn.Parameter(torch.zeros(len(channels)))
 
     @staticmethod
     def resize(x, size):
@@ -132,7 +136,8 @@ class BalancedPyramid(nn.Module):
         size = maps[len(maps) // 2].shape[-2:]
         balanced = torch.stack([self.resize(conv(x), size) for conv, x in zip(self.into, maps)]).mean(dim=0)
         balanced = self.refine(balanced)
-        return [x + conv(self.resize(balanced, x.shape[-2:])) for conv, x in zip(self.back, maps)]
+        return [x + gate.to(x.dtype) * conv(self.resize(balanced, x.shape[-2:]))
+                for conv, gate, x in zip(self.back, self.gates, maps)]
 
 
 class QuadFPN(nn.Module):
@@ -148,6 +153,7 @@ class QuadFPN(nn.Module):
         laterals = {upsamples[0] - 1} | {j for m in neck if type(m).__name__ == 'Concat'
                                          for j in m.f if 0 <= j < upsamples[0]}
         downsamples = [m.i for m in neck if type(m).__name__ == 'Conv' and m.i > upsamples[-1]]
+        self.neck_start = upsamples[0]
         self.deform = nn.ModuleDict({str(j): DeformableConv(width(layers[j])) for j in sorted(laterals)}
                                     if 'de' in parts else {})
         self.upsample = nn.ModuleDict({str(i): CARAFE(width(layers[i - 1])) for i in upsamples}
@@ -156,14 +162,17 @@ class QuadFPN(nn.Module):
         self.balance = (BalancedPyramid([head.cv2[i][0].conv.in_channels for i in range(head.nl)]) if 'bs' in parts
                         else None)
 
+    def lateral_maps(self, outputs):
+        """The backbone layers' outputs as the neck reads them: through the deformable convs (de), if on."""
+        return [self.deform[str(j)](x) if str(j) in self.deform else x for j, x in enumerate(outputs)]
+
     def layer(self, m, x):
-        """YOLO layer m on its input x, with the parts at its place: CARAFE instead of an Upsample, the space
-        attention before a bottom-up Conv, the deformable conv after a backbone map the neck reads."""
+        """Neck layer m on its input x, with the parts at its place: CARAFE instead of an Upsample, the space
+        attention before a bottom-up Conv."""
         i = str(m.i)
         if i in self.upsample:
             return self.upsample[i](x)
-        x = m(self.attend[i](x) if i in self.attend else x)
-        return self.deform[i](x) if i in self.deform else x
+        return m(self.attend[i](x) if i in self.attend else x)
 
     def head_inputs(self, maps):
         """The Detect head's input maps (P3, P4, P5), balanced if bs is on."""

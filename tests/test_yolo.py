@@ -1,6 +1,7 @@
 """sarbench/yolo.py on real images: losses and outputs in model.py's format, the COCO weights on a 1-channel input, a
 model.pt that predict.py can rebuild, and an overfit check (a pretrained YOLOv8m fits 16 training images)."""
 import json
+import math
 
 import torch
 import torch.nn.functional as F
@@ -9,7 +10,7 @@ from predict import load_model
 from sarbench.data import to_original_xywh
 from sarbench.metrics import detection_metrics
 from sarbench.quadfpn import QUAD_FPN_PARTS
-from sarbench.yolo import YOLOMultiTaskModel, pretrained_state
+from sarbench.yolo import YOLOMultiTaskModel, pretrained_state, soft_nms
 from test_model import ROOT, first_train_images, forward  # pytest puts tests/ on the path
 
 
@@ -76,6 +77,17 @@ def test_quad_fpn_starts_as_the_plain_yolov8m_and_is_under_the_trainable_limit()
     _, _, losses = forward(quad, images, targets)
     sum(losses.values()).backward()
     assert all(p.grad is not None for p in quad.quad_fpn.parameters())  # every new module is in the graph
+
+
+def test_soft_nms_ranks_an_overlapping_box_of_the_same_class_lower_instead_of_dropping_it():
+    # 3 anchors, 2 classes: boxes 0 and 1 overlap at IoU 360 / 440 (class 0); box 2 is box 1 again, but class 1
+    boxes = torch.tensor([[50., 50, 20, 20], [52, 50, 20, 20], [52, 50, 20, 20]])  # centre-xywh
+    scores = torch.tensor([[0.9, 0.0], [0.8, 0.0], [0.0, 0.7]])
+    kept = soft_nms(torch.cat([boxes, scores], dim=1).T[None], score_thresh=0.001, sigma=0.5, max_det=100)[0]
+    assert kept[:, 5].tolist() == [0, 1, 0]
+    assert torch.allclose(kept[:, 4], torch.tensor([0.9, 0.7, 0.8 * math.exp(-(360 / 440) ** 2 / 0.5)]))
+    assert torch.allclose(kept[0, :4], torch.tensor([40., 40, 60, 60]))
+    assert soft_nms(torch.cat([boxes, scores], dim=1).T[None], 0.001, 0.5, max_det=2)[0].shape == (2, 6)
 
 
 def test_predict_rebuilds_the_model_from_a_run_folder(tmp_path):

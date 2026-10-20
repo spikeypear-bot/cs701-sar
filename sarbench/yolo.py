@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
-from torchvision.ops import box_convert, clip_boxes_to_image
+from torchvision.ops import box_convert, box_iou, clip_boxes_to_image
 
 from sarbench.quadfpn import QuadFPN
 
@@ -16,6 +16,8 @@ YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolov8l', 'yolo11s', 'yolo11m', 'yolo11l')
 # 11l 25.3 M. v8l is over the 40 M trainable limit unless its first 6 layers are frozen (freeze_layers=6: 39.7 M
 # trainable at 9 classes)
 WEIGHTS_URL = 'https://github.com/ultralytics/assets/releases/download/v8.3.0/{}.pt'  # COCO detection weights
+NMS = ('hard', 'soft')
+SOFT_NMS_CANDIDATES = 3000  # highest-scored (box, class) pairs per image that Soft-NMS ranks
 
 
 def pretrained_state(name, in_chans):
@@ -35,6 +37,37 @@ def pretrained_state(name, in_chans):
     return state
 
 
+def soft_nms(predictions, score_thresh, sigma, max_det):
+    """Gaussian Soft-NMS (Bodla et al., ICCV 2017), per class, multi-label: predictions [B, 4 + classes, anchors]
+    (centre-xywh px, scores) -> per image [n, 6]: xyxy, score, class, as Ultralytics' non_max_suppression. Each
+    (box, class) pair with a score >= score_thresh is a candidate (the SOFT_NMS_CANDIDATES best); max_det times, the
+    best is kept and the scores of the other boxes of its class are multiplied by exp(-IoU^2 / sigma), so an
+    overlapping box is ranked lower instead of dropped. Kept scores below score_thresh are dropped."""
+    kept = []
+    for p in predictions:
+        p = p.T  # [anchors, 4 + classes]
+        anchors, classes = (p[:, 4:] >= score_thresh).nonzero(as_tuple=True)
+        scores = p[anchors, 4 + classes]
+        top = scores.topk(min(len(scores), SOFT_NMS_CANDIDATES)).indices
+        anchors, classes, scores = anchors[top], classes[top], scores[top]
+        boxes = box_convert(p[anchors, :4], 'cxcywh', 'xyxy')
+        shifted = boxes + classes[:, None] * (boxes.max() + 1) if len(boxes) else boxes  # classes never overlap
+        picked, picked_scores = [], []
+        for _ in range(min(max_det, len(scores))):
+            i = scores.argmax()
+            picked.append(i)
+            picked_scores.append(scores[i])
+            scores = scores * torch.exp(-box_iou(shifted[i, None], shifted)[0] ** 2 / sigma)
+            scores[i] = -1  # taken
+        if not picked:
+            kept.append(p.new_zeros((0, 6)))
+            continue
+        picked, picked_scores = torch.stack(picked), torch.stack(picked_scores)
+        out = torch.cat([boxes[picked], picked_scores[:, None], classes[picked, None].float()], dim=1)
+        kept.append(out[picked_scores >= score_thresh])
+    return kept
+
+
 class YOLOMultiTaskModel(nn.Module):
     """images [B, C, H, W] -> classification logits (global average of the SPPF map -> LayerNorm -> Linear) and
     YOLO detections. `backbone` is the whole YOLO network (backbone, neck and head): it is pretrained, so train.py gives
@@ -44,10 +77,11 @@ class YOLOMultiTaskModel(nn.Module):
     Quad-FPN to add to the neck (sarbench/quadfpn.py), new modules trained at --lr as the classification head.
     Training: YOLO's own loss (task-aligned assignment, BCE classes, CIoU + DFL boxes; Ultralytics' gains 7.5, 0.5,
     1.5), per image. Inference: Ultralytics' validation settings, confidence >= 0.001, NMS at IoU 0.7, one box may
-    carry several classes; at most 100 detections per image, as COCO mAP counts."""
+    carry several classes; at most 100 detections per image, as COCO mAP counts. nms='soft': Gaussian Soft-NMS
+    (soft_nms, soft_sigma) in place of NMS; train.py always validates with NMS, predict.py can switch."""
 
     def __init__(self, name, pretrained: bool, in_chans=1, num_classes=9, freeze_layers=0, score_thresh=0.001,
-                 nms_thresh=0.7, detections_per_img=100, quad_fpn=()):
+                 nms_thresh=0.7, detections_per_img=100, quad_fpn=(), nms='hard', soft_sigma=0.5):
         super().__init__()
         from ultralytics.nn.tasks import DetectionModel
         self.backbone = DetectionModel(f'{name}.yaml', ch=in_chans, nc=num_classes, verbose=False)
@@ -66,6 +100,7 @@ class YOLOMultiTaskModel(nn.Module):
         self.cls_head = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, num_classes))
         self.quad_fpn = QuadFPN(layers, quad_fpn) if quad_fpn else None
         self.score_thresh, self.nms_thresh, self.detections_per_img = score_thresh, nms_thresh, detections_per_img
+        self.nms, self.soft_sigma = nms, soft_sigma
         self.criterion = None  # v8DetectionLoss, made on the first training step: it takes the model's device then
 
     def features(self, x):
@@ -104,10 +139,13 @@ class YOLOMultiTaskModel(nn.Module):
         """The head's raw maps -> per-image {'boxes' XYXY on the input, 'labels' 1..9, 'scores'}, as torchvision's."""
         from ultralytics.utils.ops import non_max_suppression
         predictions = self.backbone.model[-1]._inference(raw)  # [B, 4 + classes, anchors]: centre-xywh px, scores
-        # max_time_img: Ultralytics stops NMS after 0.05 s per image and leaves the remaining images empty, which an
-        # early, unsure model can hit at confidence 0.001; here no time limit
-        kept = non_max_suppression(predictions, self.score_thresh, self.nms_thresh, multi_label=True,
-                                   max_det=self.detections_per_img, max_time_img=1e6)  # [n, 6]: xyxy score class
+        if self.nms == 'soft':
+            kept = soft_nms(predictions, self.score_thresh, self.soft_sigma, self.detections_per_img)
+        else:
+            # max_time_img: Ultralytics stops NMS after 0.05 s per image and leaves the remaining images empty, which
+            # an early, unsure model can hit at confidence 0.001; here no time limit
+            kept = non_max_suppression(predictions, self.score_thresh, self.nms_thresh, multi_label=True,
+                                       max_det=self.detections_per_img, max_time_img=1e6)  # [n, 6]: xyxy score class
         return [{'boxes': clip_boxes_to_image(d[:, :4], size), 'scores': d[:, 4], 'labels': d[:, 5].long() + 1}
                 for d in kept]
 

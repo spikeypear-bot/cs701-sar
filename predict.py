@@ -18,7 +18,7 @@ from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import SARImages, collate_images
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import MultiTaskModel, SwinMultiTaskModel
-from sarbench.yolo import YOLO_MODELS, YOLOMultiTaskModel
+from sarbench.yolo import NMS, YOLO_MODELS, YOLOMultiTaskModel
 from train import headline
 
 
@@ -31,9 +31,21 @@ def parse_args():
     p.add_argument('--out', type=Path, help='default: <run>/submission_<folder of images.json>.zip')
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--workers', type=int, default=8)
+    p.add_argument('--nms', choices=NMS, help='YOLO runs only: hard (NMS, as in training) or soft (Gaussian Soft-NMS: '
+                                              'overlapping boxes of a class are ranked lower, not dropped)')
+    p.add_argument('--nms-thresh', type=float, help='YOLO, hard NMS: IoU above which a box is dropped (default: 0.7)')
+    p.add_argument('--soft-sigma', type=float, help='YOLO, soft NMS: scores times exp(-IoU^2 / sigma) (default: 0.5, '
+                                                    'as Bodla et al.)')
+    p.add_argument('--score-thresh', type=float, help='YOLO: lowest score kept (default: 0.001)')
     args = p.parse_args()
     args.root = args.root or args.images.parent
-    args.out = args.out or args.run / f'submission_{args.images.parent.name}.zip'
+    # the post-processing options given, set on the model; they go in the default zip name, so that the zip of the
+    # run's own settings is not overwritten
+    args.postprocess = {k: v for k, v in (('nms', args.nms), ('nms_thresh', args.nms_thresh),
+                                          ('soft_sigma', args.soft_sigma), ('score_thresh', args.score_thresh))
+                        if v is not None}
+    suffix = ''.join(f'_{k}-{v}' for k, v in args.postprocess.items())
+    args.out = args.out or args.run / f'submission_{args.images.parent.name}{suffix}.zip'
     return args
 
 
@@ -98,7 +110,12 @@ def main():
     dataset = SARImages(args.images, args.root, size=size, channels=options.get('input_channels', 'raw').split(','),
                         stats=options.get('channel_stats'))
     loader = DataLoader(dataset, args.batch_size, num_workers=args.workers, collate_fn=collate_images)
-    preds = predict(load_model(args.run), loader)
+    model = load_model(args.run)
+    if args.postprocess and not isinstance(model, YOLOMultiTaskModel):
+        raise SystemExit('--nms, --nms-thresh, --soft-sigma and --score-thresh are for YOLO runs')
+    for name, value in args.postprocess.items():
+        setattr(model, name, value)
+    preds = predict(model, loader)
     write_submission(dataset.images, preds, size=size, out=args.out)
     print(f'{len(preds)} images -> {args.out}')
     if 'annotations' in json.loads(args.images.read_text()):

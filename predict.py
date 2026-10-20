@@ -44,7 +44,8 @@ def load_model(run):
     state = torch.load(run / 'model.pt', map_location='cpu')
     if options['backbone'] in YOLO_MODELS:  # the whole detector, rebuilt from its Ultralytics config
         model = YOLOMultiTaskModel(options['backbone'], pretrained=False,
-                                   in_chans=len(options.get('input_channels', 'raw').split(',')))
+                                   in_chans=len(options.get('input_channels', 'raw').split(',')),
+                                   quad_fpn=options.get('quad_fpn', []))  # runs before --quad-fpn: none
         model.load_state_dict(state)
         return model.cuda().eval()
     backbone = build_backbone(options['backbone'], pretrained=False,  # every weight comes from model.pt

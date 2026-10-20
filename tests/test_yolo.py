@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from predict import load_model
 from sarbench.data import to_original_xywh
 from sarbench.metrics import detection_metrics
+from sarbench.quadfpn import QUAD_FPN_PARTS
 from sarbench.yolo import YOLOMultiTaskModel, pretrained_state
 from test_model import ROOT, first_train_images, forward  # pytest puts tests/ on the path
 
@@ -48,6 +49,33 @@ def test_yolov8l_with_6_frozen_layers_is_under_the_trainable_limit():
     assert 39.6e6 < trainable < 40e6
     assert not any(p.requires_grad for p in model.backbone.model[:6].parameters())
     assert all(p.requires_grad for p in model.backbone.model[6].parameters())
+
+
+def test_quad_fpn_parts_sit_in_the_neck_of_yolov8_and_yolo11():
+    for name, laterals, upsamples, downsamples in (('yolov8m', ['4', '6', '9'], ['10', '13'], ['16', '19']),
+                                                   ('yolo11m', ['4', '6', '10'], ['11', '14'], ['17', '20'])):
+        quad = YOLOMultiTaskModel(name, pretrained=False, quad_fpn=QUAD_FPN_PARTS).quad_fpn
+        assert (list(quad.deform), list(quad.upsample), list(quad.attend)) == (laterals, upsamples, downsamples)
+        assert len(quad.balance.into) == 3
+
+
+def test_quad_fpn_starts_as_the_plain_yolov8m_and_is_under_the_trainable_limit():
+    torch.manual_seed(0)
+    plain = YOLOMultiTaskModel('yolov8m', pretrained=False).cuda().eval()
+    quad = YOLOMultiTaskModel('yolov8m', pretrained=False, quad_fpn=QUAD_FPN_PARTS).cuda().eval()
+    missing, unexpected = quad.load_state_dict(plain.state_dict(), strict=False)
+    assert not unexpected and missing and all(k.startswith('quad_fpn.') for k in missing)
+    images, _, targets = first_train_images(2)
+    with torch.no_grad():
+        expected, got = forward(plain, images), forward(quad, images)
+    assert torch.allclose(expected[0], got[0])
+    assert all(torch.allclose(a['boxes'], b['boxes']) for a, b in zip(expected[1], got[1]))
+    added = sum(p.numel() for p in quad.quad_fpn.parameters())
+    assert 11e6 < added < 12e6 and sum(p.numel() for p in quad.parameters()) < 40e6
+    quad.train()
+    _, _, losses = forward(quad, images, targets)
+    sum(losses.values()).backward()
+    assert all(p.grad is not None for p in quad.quad_fpn.parameters())  # every new module is in the graph
 
 
 def test_predict_rebuilds_the_model_from_a_run_folder(tmp_path):

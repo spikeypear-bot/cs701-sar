@@ -37,4 +37,12 @@ sbatch --time=10:00:00 train.slurm --backbone yolov8l --init pretrained --adapt 
 sbatch train.slurm --backbone yolo11m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolo11m-e48
 # YOLO11l (COCO, all ~25 M trained, same size as v8m) + image-class head on SPPF; same recipe as yolov8m-e48 (AdamW 1e-3, wd 5e-4, 48 ep), vs yolov8m-e48
 sbatch train.slurm --backbone yolo11l --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolo11l-e48
+# YOLOv8m, same recipe as yolov8m-e48 (AdamW 1e-3, wd 5e-4) at 60 ep (~2 h), vs yolov8m-e48
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 60 --name yolov8m-e60
+# YOLO11m, same recipe as yolo11m-e48 (AdamW 1e-3, wd 5e-4) at 60 ep, vs yolo11m-e48 and yolov8m-e60
+sbatch train.slurm --backbone yolo11m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 60 --name yolo11m-e60
+# YOLO11s (COCO, all ~9.4 M trained) + image-class head on SPPF; same recipe as yolo11m-e60 (AdamW 1e-3, wd 5e-4, 60 ep), vs yolo11m-e60
+sbatch train.slurm --backbone yolo11s --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 60 --name yolo11s-e60
+# YOLOv8m + Quad-FPN in the neck (all 4 parts: deformable convs, CARAFE, space attention, balanced pyramid + non-local; +11.35 M, 37.2 M trainable, each starts as the identity); same recipe as yolov8m-e48, vs yolov8m-e48
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --quad-fpn all --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-quadfpn-e48
 ```

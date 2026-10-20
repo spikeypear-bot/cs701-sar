@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torchvision.ops import box_convert, clip_boxes_to_image
 
+from sarbench.quadfpn import QuadFPN
+
 YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolov8l', 'yolo11s', 'yolo11m', 'yolo11l')  # the choices of --backbone;
 # parameters with COCO's 80 classes (a little fewer at 9): v8s 11.2 M, v8m 25.9 M, v8l 43.7 M, 11s 9.4 M, 11m 20.1 M,
 # 11l 25.3 M. v8l is over the 40 M trainable limit unless its first 6 layers are frozen (freeze_layers=6: 39.7 M
@@ -38,13 +40,14 @@ class YOLOMultiTaskModel(nn.Module):
     YOLO detections. `backbone` is the whole YOLO network (backbone, neck and head): it is pretrained, so train.py gives
     it --backbone-lr, and the new classification head --lr. Only the head's last class convs start untrained (9
     classes instead of COCO's 80). freeze_layers=N freezes YOLO layers 0..N-1, as Ultralytics' freeze=N (their BatchNorm
-    statistics still adapt to SAR in training mode; they are buffers, not trained parameters).
+    statistics still adapt to SAR in training mode; they are buffers, not trained parameters). quad_fpn: the parts of
+    Quad-FPN to add to the neck (sarbench/quadfpn.py), new modules trained at --lr as the classification head.
     Training: YOLO's own loss (task-aligned assignment, BCE classes, CIoU + DFL boxes; Ultralytics' gains 7.5, 0.5,
     1.5), per image. Inference: Ultralytics' validation settings, confidence >= 0.001, NMS at IoU 0.7, one box may
     carry several classes; at most 100 detections per image, as COCO mAP counts."""
 
     def __init__(self, name, pretrained: bool, in_chans=1, num_classes=9, freeze_layers=0, score_thresh=0.001,
-                 nms_thresh=0.7, detections_per_img=100):
+                 nms_thresh=0.7, detections_per_img=100, quad_fpn=()):
         super().__init__()
         from ultralytics.nn.tasks import DetectionModel
         self.backbone = DetectionModel(f'{name}.yaml', ch=in_chans, nc=num_classes, verbose=False)
@@ -61,16 +64,18 @@ class YOLOMultiTaskModel(nn.Module):
         self.sppf = next(m.i for m in layers if type(m).__name__ == 'SPPF')
         channels = layers[self.sppf].cv2.conv.out_channels  # v8m: 576
         self.cls_head = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, num_classes))
+        self.quad_fpn = QuadFPN(layers, quad_fpn) if quad_fpn else None
         self.score_thresh, self.nms_thresh, self.detections_per_img = score_thresh, nms_thresh, detections_per_img
         self.criterion = None  # v8DetectionLoss, made on the first training step: it takes the model's device then
 
     def features(self, x):
-        """Every layer but the detection head, as Ultralytics' _predict_once -> the outputs of all layers."""
+        """Every layer but the detection head, as Ultralytics' _predict_once -> the outputs of all layers (with
+        Quad-FPN's parts in the neck, if on)."""
         outputs = []
         for m in self.backbone.model[:-1]:
             if m.f != -1:  # input from earlier layers (Concat), not only the previous one
                 x = outputs[m.f] if isinstance(m.f, int) else [x if j == -1 else outputs[j] for j in m.f]
-            x = m(x)
+            x = self.quad_fpn.layer(m, x) if self.quad_fpn is not None else m(x)
             outputs.append(x)
         return outputs
 
@@ -110,7 +115,10 @@ class YOLOMultiTaskModel(nn.Module):
         outputs = self.features(images)
         logits = self.cls_head(outputs[self.sppf].mean(dim=(2, 3)))
         head = self.backbone.model[-1]  # Detect, on the P3, P4, P5 maps of the neck (strides 8, 16, 32)
-        raw = [torch.cat((head.cv2[i](outputs[j]), head.cv3[i](outputs[j])), 1) for i, j in enumerate(head.f)]
+        maps = [outputs[j] for j in head.f]
+        if self.quad_fpn is not None:
+            maps = self.quad_fpn.head_inputs(maps)
+        raw = [torch.cat((head.cv2[i](x), head.cv3[i](x)), 1) for i, x in enumerate(maps)]
         with torch.autocast(images.device.type, enabled=False):
             raw = [r.float() for r in raw]
             if self.training:

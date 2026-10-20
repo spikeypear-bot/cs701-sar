@@ -17,6 +17,7 @@ from sarbench.backbones import SWIN_MODELS, build_backbone
 from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import DETECTORS, RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
+from sarbench.quadfpn import QUAD_FPN_PARTS
 from sarbench.simmim import load_ssl
 from sarbench.yolo import YOLO_MODELS, YOLOMultiTaskModel
 
@@ -36,6 +37,11 @@ def parse_blocks(spec):
         first, _, last = part.partition('-')
         blocks += range(int(first), int(last or first) + 1)
     return blocks
+
+
+def parse_parts(spec):
+    """'all' -> every Quad-FPN part; 'de,bs' -> ['de', 'bs']"""
+    return list(QUAD_FPN_PARTS) if spec == 'all' else list(filter(None, spec.split(',')))
 
 
 def parse_loss_weights(spec):
@@ -100,6 +106,11 @@ def parse_args():
     p.add_argument('--freeze-layers', type=int, default=0,
                    help='YOLO only: freeze its layers 0..N-1, as Ultralytics\' freeze=N (yolov8l: 6 is the least that '
                         'keeps it under 40 M trainable, 39.7 M; default: 0)')
+    p.add_argument('--quad-fpn', type=parse_parts, default=[],
+                   help='YOLO only: Quad-FPN (Zhang et al. 2021) in the neck, all or some of de (deformable convs on '
+                        'the backbone maps), ca (CARAFE upsampling), pa (space attention before the bottom-up '
+                        'down-sampling), bs (balanced pyramid with a non-local block), e.g. all or de,ca; each starts '
+                        'as the identity; yolov8m all: 11.35 M parameters (default: off); see sarbench/quadfpn.py')
     p.add_argument('--unfreeze-lr', type=float, default=2e-5,
                    help='for the pretrained weights of --unfreeze-blocks (default: 2e-5, as for full fine-tuning)')
     p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
@@ -141,6 +152,10 @@ def parse_args():
         p.error('--fgfm-levels is for the Swin backbones (an FPN over 4 backbone maps)')
     if not set(args.fgfm_levels) <= {0, 1, 2, 3}:
         p.error('--fgfm-levels takes levels 0 to 3')
+    if args.quad_fpn and args.backbone not in YOLO_MODELS:
+        p.error('--quad-fpn is for the YOLO backbones')
+    if not set(args.quad_fpn) <= set(QUAD_FPN_PARTS):
+        p.error(f'--quad-fpn takes all or parts from {QUAD_FPN_PARTS}')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):
         p.error(f'--input-channels takes names from {CHANNELS}')
     if args.detector == 'retinanet' and args.rpn_match != 'iou':
@@ -284,7 +299,7 @@ def main():
     if args.backbone in YOLO_MODELS:  # a whole detector, every parameter trained (sarbench/yolo.py)
         model = YOLOMultiTaskModel(args.backbone, pretrained=args.init == 'pretrained',
                                    in_chans=len(args.input_channels.split(',')),
-                                   freeze_layers=args.freeze_layers).cuda()
+                                   freeze_layers=args.freeze_layers, quad_fpn=args.quad_fpn).cuda()
         log(f'{args.backbone}: {model.transferred} tensors from the COCO weights', log_file)
     else:
         backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',

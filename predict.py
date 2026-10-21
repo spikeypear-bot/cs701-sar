@@ -1,7 +1,10 @@
 """Predict images with a trained run and write the submission zip for Codabench.
 Example: python predict.py runs/<run> cs701-sar-course-data/val/images.json
 On a file with labels, such as the local holdout (data/detection/instances_val.json --root data), it also scores
-the zip: a check of the whole path to the zip, which should give the run's own test scores."""
+the zip: a check of the whole path to the zip, which should give the run's own test scores.
+--class-filter uses that every image holds boxes of one class only: hard keeps only the boxes of the image's predicted
+class; soft multiplies each box's score by the image classifier's probability of the box's class, so a wrong-class box
+sinks when the classifier is sure, and both classes keep their boxes when it is not."""
 import argparse
 import csv
 import io
@@ -39,6 +42,9 @@ def parse_args():
     p.add_argument('--score-thresh', type=float, help='YOLO: lowest score kept (default: 0.001)')
     p.add_argument('--keypoint-centres', action='store_true',
                    help='YOLO runs with --centre-keypoint only: move each box onto its predicted centre keypoint')
+    p.add_argument('--class-filter', choices=('hard', 'soft'),
+                   help='any run: keep only the boxes of the predicted image class (hard), or multiply each box score '
+                        'by the image-class probability of its class (soft) (default: off)')
     args = p.parse_args()
     args.root = args.root or args.images.parent
     # the post-processing options given, set on the model; they go in the default zip name, so that the zip of the
@@ -47,7 +53,8 @@ def parse_args():
                                           ('soft_sigma', args.soft_sigma), ('score_thresh', args.score_thresh),
                                           ('keypoint_centres', args.keypoint_centres or None))
                         if v is not None}
-    suffix = ''.join(f'_{k}-{v}' for k, v in args.postprocess.items())
+    suffix = ''.join(f'_{k}-{v}' for k, v in (*args.postprocess.items(), ('class_filter', args.class_filter))
+                     if v is not None)
     args.out = args.out or args.run / f'submission_{args.images.parent.name}{suffix}.zip'
     return args
 
@@ -81,16 +88,22 @@ def load_model(run):
 
 
 @torch.no_grad()
-def predict(model, loader):
+def predict(model, loader, class_filter=None):
     """preds[file_name] = (label 0..8, boxes XYXY on the model input, classes 0..8, scores), as write_submission
-    takes them."""
+    takes them. class_filter: None, 'hard' or 'soft', see the module docstring."""
     preds = {}
     for images, infos in loader:
         with torch.autocast('cuda', dtype=torch.bfloat16):
             logits, outputs, _ = model(images.cuda())
-        for info, label, out in zip(infos, logits.argmax(dim=1).tolist(), outputs):
-            classes = (out['labels'] - 1).tolist()  # the detector's labels are 1..9 (0 = background)
-            preds[info['file_name']] = (label, out['boxes'].tolist(), classes, out['scores'].tolist())
+        for info, probabilities, out in zip(infos, logits.float().softmax(dim=1), outputs):
+            label = int(probabilities.argmax())
+            boxes, classes, scores = out['boxes'], out['labels'] - 1, out['scores']  # detector labels 1..9 (0: none)
+            if class_filter == 'hard':
+                keep = classes == label
+                boxes, classes, scores = boxes[keep], classes[keep], scores[keep]
+            elif class_filter == 'soft':
+                scores = scores * probabilities[classes]
+            preds[info['file_name']] = (label, boxes.tolist(), classes.tolist(), scores.tolist())
     return preds
 
 
@@ -121,7 +134,7 @@ def main():
         raise SystemExit('--keypoint-centres needs a run trained with --centre-keypoint')
     for name, value in args.postprocess.items():
         setattr(model, name, value)
-    preds = predict(model, loader)
+    preds = predict(model, loader, args.class_filter)
     write_submission(dataset.images, preds, size=size, out=args.out)
     print(f'{len(preds)} images -> {args.out}')
     if 'annotations' in json.loads(args.images.read_text()):

@@ -53,4 +53,6 @@ sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --crop-prob
 sbatch --time=10:00:00 train.slurm --backbone yolov8m --init pretrained --adapt full --image-size 800 --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-800-e48
 # YOLOv8m-P2 (yolov8-p2.yaml: 4th Detect level at stride 4; COCO weights in layers 0-15 only, the P2 neck and head new; 25.1 M), 512 px; same recipe as yolov8m-e48, vs yolov8m-e48; ~1.25x compute
 sbatch train.slurm --backbone yolov8m-p2 --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-p2-e48
+# Ultralytics' own trainer + default recipe (EMA, mosaic, scale/translate, warmup, AdamW auto lr), YOLOv8m COCO, 512 px, 48 ep, detection only; holdout scored as train.py does; vs yolov8m-e48 (41.89 mAP)
+sbatch train.slurm ultralytics_baseline.py --model yolov8m --epochs 48 --name ul-yolov8m-e48
 ```

@@ -11,11 +11,16 @@ from torchvision.ops import box_convert, box_iou, clip_boxes_to_image
 
 from sarbench.quadfpn import QuadFPN
 
-YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolov8l', 'yolo11s', 'yolo11m', 'yolo11l')  # the choices of --backbone;
+YOLO_MODELS = ('yolov8s', 'yolov8m', 'yolov8l', 'yolov8s-p2', 'yolov8m-p2', 'yolov8l-p2', 'yolo11s', 'yolo11m',
+               'yolo11l')  # the choices of --backbone;
 # parameters with COCO's 80 classes (a little fewer at 9): v8s 11.2 M, v8m 25.9 M, v8l 43.7 M, 11s 9.4 M, 11m 20.1 M,
 # 11l 25.3 M. v8l is over the 40 M trainable limit unless its first 6 layers are frozen (freeze_layers=6: 39.7 M
-# trainable at 9 classes)
+# trainable at 9 classes). -p2: Ultralytics' yolov8-p2.yaml, a fourth Detect level at stride 4 (P2, fed by backbone
+# layer 2) for tiny objects; at 9 classes v8s-p2 10.6 M, v8m-p2 25.1 M, v8l-p2 42.9 M (freeze_layers=6: 38.9 M
+# trainable). Fewer than without P2: Detect sizes its class branches by its first level, now P2's narrower map
 WEIGHTS_URL = 'https://github.com/ultralytics/assets/releases/download/v8.3.0/{}.pt'  # COCO detection weights
+P2_SHARED_LAYERS = 16  # layers 0-15 of a -p2 model (backbone, top-down neck down to P3) are those of the plain one;
+# from 16 on its layers are new (the P2 path) or the plain one's moved to other indices, so they start untrained
 NMS = ('hard', 'soft')
 SOFT_NMS_CANDIDATES = 3000  # highest-scored (box, class) pairs per image that Soft-NMS ranks
 
@@ -86,25 +91,33 @@ class YOLOMultiTaskModel(nn.Module):
     (8 x box area)) at its default sigma 1 for a single keypoint, gain 12), on top of the detection loss; boxes are
     still assigned and trained by IoU. The keypoint is xy only: every centre is visible, so no visibility score.
     keypoint_centres (inference, predict.py): each kept box is moved so that its centre is its predicted keypoint, its
-    width and height kept."""
+    width and height kept. A -p2 name (yolov8m-p2): the same network with a fourth head level at stride 4; the COCO
+    weights of the plain model go into its layers 0-15 only (P2_SHARED_LAYERS); neither quad_fpn nor centre_keypoint
+    (Ultralytics has no P2 pose model)."""
 
     def __init__(self, name, pretrained: bool, in_chans=1, num_classes=9, freeze_layers=0, score_thresh=0.001,
                  nms_thresh=0.7, detections_per_img=100, quad_fpn=(), nms='hard', soft_sigma=0.5,
                  centre_keypoint=False, keypoint_centres=False):
         super().__init__()
         from ultralytics.nn.tasks import DetectionModel, PoseModel
+        p2 = name.endswith('-p2')
+        if p2 and (quad_fpn or centre_keypoint):
+            raise ValueError(f'{name} takes neither quad_fpn nor centre_keypoint')
         self.centre_keypoint = centre_keypoint
         if centre_keypoint:  # the COCO detection weights below fit it too: it differs only by the Pose head's cv4
             self.backbone = PoseModel(f'{name}-pose.yaml', ch=in_chans, nc=num_classes, data_kpt_shape=(1, 2),
                                       verbose=False)
-        else:
+        else:  # yolov8m-p2.yaml: Ultralytics reads it as yolov8-p2.yaml at scale m
             self.backbone = DetectionModel(f'{name}.yaml', ch=in_chans, nc=num_classes, verbose=False)
         # the loss gains v8DetectionLoss and v8PoseLoss read: Ultralytics' defaults
         self.backbone.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, pose=12.0, kobj=1.0)
         self.transferred = 0  # pretrained tensors loaded, for the log
         if pretrained:
             own = self.backbone.state_dict()
-            state = {k: v for k, v in pretrained_state(name, in_chans).items() if k in own and v.shape == own[k].shape}
+            # keys 'model.<layer>.…'; -p2: only the shared layers, so no moved layer takes weights by a chance match
+            shared = lambda key: not p2 or int(key.split('.')[1]) < P2_SHARED_LAYERS
+            state = {k: v for k, v in pretrained_state(name.split('-')[0], in_chans).items()  # yolov8m-p2: yolov8m.pt
+                     if k in own and v.shape == own[k].shape and shared(k)}
             self.backbone.load_state_dict(state, strict=False)
             self.transferred = len(state)
         layers = self.backbone.model
@@ -186,7 +199,8 @@ class YOLOMultiTaskModel(nn.Module):
         fp32 before boxes are decoded, so no coordinate snaps to bf16's 2 px grid near 512."""
         outputs, sppf = self.features(images)
         logits = self.cls_head(sppf.mean(dim=(2, 3)))
-        head = self.backbone.model[-1]  # Detect (Pose), on the P3, P4, P5 maps of the neck (strides 8, 16, 32)
+        # Detect (Pose), on the P3, P4, P5 maps of the neck (strides 8, 16, 32); -p2: P2 (stride 4) to P5
+        head = self.backbone.model[-1]
         maps = [outputs[j] for j in head.f]
         if self.quad_fpn is not None:
             maps = self.quad_fpn.head_inputs(maps)

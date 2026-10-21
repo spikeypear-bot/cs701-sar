@@ -105,7 +105,7 @@ def parse_args():
                         'frozen and unmerged, under the --adapt adapters; Swin, LoRA/MoE-LoRA and raw input only')
     p.add_argument('--freeze-layers', type=int, default=0,
                    help='YOLO only: freeze its layers 0..N-1, as Ultralytics\' freeze=N (yolov8l: 6 is the least that '
-                        'keeps it under 40 M trainable, 39.7 M; default: 0)')
+                        'keeps it under 40 M trainable, 39.7 M; yolov8l-p2: 6 too, 38.9 M; default: 0)')
     p.add_argument('--quad-fpn', type=parse_parts, default=[],
                    help='YOLO only: Quad-FPN (Zhang et al. 2021) in the neck, all or some of de (deformable convs on '
                         'the backbone maps), ca (CARAFE upsampling), pa (space attention before the bottom-up '
@@ -135,7 +135,7 @@ def parse_args():
                         'harbor and airport need their surroundings)')
     p.add_argument('--image-size', type=int, default=512,
                    help='side of the square model input in pixels, a multiple of 32; images are stretched to it and '
-                        'the anchors scale with it (default: 512; ViT and Swin)')
+                        'the anchors scale with it (default: 512; ViT, Swin and YOLO)')
     p.add_argument('--epochs', type=int, default=24)
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--accum-steps', type=int, default=1,
@@ -169,6 +169,8 @@ def parse_args():
         p.error('--quad-fpn is for the YOLO backbones')
     if args.centre_keypoint and args.backbone not in YOLO_MODELS:
         p.error('--centre-keypoint is for the YOLO backbones')
+    if args.backbone.endswith('-p2') and (args.quad_fpn or args.centre_keypoint):
+        p.error('the -p2 YOLO models take neither --quad-fpn nor --centre-keypoint')
     if not set(args.quad_fpn) <= set(QUAD_FPN_PARTS):
         p.error(f'--quad-fpn takes all or parts from {QUAD_FPN_PARTS}')
     if not set(args.input_channels.split(',')) <= set(CHANNELS):

@@ -1,8 +1,10 @@
 """sarbench/yolo.py on real images: losses and outputs in model.py's format, the COCO weights on a 1-channel input, a
-model.pt that predict.py can rebuild, and an overfit check (a pretrained YOLOv8m fits 16 training images)."""
+model.pt that predict.py can rebuild, and an overfit check (a pretrained YOLOv8m fits 16 training images); the same
+for the P2 model (yolov8m-p2)."""
 import json
 import math
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -79,6 +81,37 @@ def test_quad_fpn_starts_as_the_plain_yolov8m_and_is_under_the_trainable_limit()
     assert all(p.grad is not None for p in quad.quad_fpn.parameters())  # every new module is in the graph
 
 
+def test_p2_model_adds_a_stride_4_level_and_takes_the_coco_weights_of_the_layers_it_shares():
+    model = YOLOMultiTaskModel('yolov8m-p2', pretrained=True)
+    head = model.backbone.model[-1]
+    assert head.f == [18, 21, 24, 27] and head.stride.tolist() == [4, 8, 16, 32]
+    own, coco = model.backbone.state_dict(), pretrained_state('yolov8m', in_chans=1)
+    shared = [k for k in own if int(k.split('.')[1]) < 16]  # backbone and top-down neck: as in yolov8m
+    assert model.transferred == len(shared) and all(torch.equal(own[k], coco[k]) for k in shared)
+    assert 25.0e6 < sum(p.numel() for p in model.parameters()) < 25.1e6  # 25.06 M by hand from yolov8-p2.yaml
+    with pytest.raises(ValueError):
+        YOLOMultiTaskModel('yolov8m-p2', pretrained=False, centre_keypoint=True)
+
+
+def test_p2_model_trains_and_detects_on_all_four_levels():
+    model = YOLOMultiTaskModel('yolov8m-p2', pretrained=True).cuda().train()
+    images, _, targets = first_train_images(2)
+    _, _, losses = forward(model, images, targets)
+    assert set(losses) == {'loss_yolo_box', 'loss_yolo_cls', 'loss_yolo_dfl'}
+    assert all(loss.dtype == torch.float32 and loss.isfinite() and loss > 0 for loss in losses.values())
+    sum(losses.values()).backward()
+    new = [p for p in model.backbone.model[16:].parameters() if p.requires_grad]  # the untrained P2 neck and head
+    assert new and all(p.grad is not None for p in new)  # all in the graph
+    # the P2 class branch is trained at every stride-4 point (its box branch only where a box is assigned)
+    assert all(p.grad.abs().sum() > 0 for p in model.backbone.model[-1].cv3[0].parameters())
+    model.eval()
+    with torch.no_grad():
+        _, detections, _ = forward(model, images)
+    assert model.backbone.model[-1].anchors.shape[1] == 128**2 + 64**2 + 32**2 + 16**2  # points at strides 4-32
+    boxes = torch.cat([d['boxes'] for d in detections])
+    assert all(0 < len(d['boxes']) <= 100 for d in detections) and boxes.min() >= 0 and boxes.max() <= 512
+
+
 def test_soft_nms_ranks_an_overlapping_box_of_the_same_class_lower_instead_of_dropping_it():
     # 3 anchors, 2 classes: boxes 0 and 1 overlap at IoU 360 / 440 (class 0); box 2 is box 1 again, but class 1
     boxes = torch.tensor([[50., 50, 20, 20], [52, 50, 20, 20], [52, 50, 20, 20]])  # centre-xywh
@@ -113,10 +146,11 @@ def test_centre_keypoint_model_trains_on_box_centres_and_can_move_boxes_onto_the
         assert not torch.equal(a['boxes'], b['boxes'])
 
 
-def test_predict_rebuilds_the_model_from_a_run_folder(tmp_path):
-    model = YOLOMultiTaskModel('yolov8m', pretrained=False).cuda().eval()
+@pytest.mark.parametrize('name', ['yolov8m', 'yolov8m-p2'])
+def test_predict_rebuilds_the_model_from_a_run_folder(tmp_path, name):
+    model = YOLOMultiTaskModel(name, pretrained=False).cuda().eval()
     torch.save(model.state_dict(), tmp_path / 'model.pt')
-    (tmp_path / 'metrics.json').write_text(json.dumps({'args': {'backbone': 'yolov8m', 'adapt': 'full'}}))
+    (tmp_path / 'metrics.json').write_text(json.dumps({'args': {'backbone': name, 'adapt': 'full'}}))
     images = first_train_images(2)[0]
     with torch.no_grad():
         expected, rebuilt = forward(model, images), forward(load_model(tmp_path), images)
@@ -124,10 +158,11 @@ def test_predict_rebuilds_the_model_from_a_run_folder(tmp_path):
     assert all(torch.allclose(a['boxes'], b['boxes']) for a, b in zip(expected[1], rebuilt[1]))
 
 
-def test_pretrained_yolov8m_overfits_16_training_images():
+@pytest.mark.parametrize('name', ['yolov8m', 'yolov8m-p2'])
+def test_pretrained_yolov8m_overfits_16_training_images(name):
     torch.manual_seed(0)
     images, labels, targets = first_train_images(16)
-    model = YOLOMultiTaskModel('yolov8m', pretrained=True).cuda().train()
+    model = YOLOMultiTaskModel(name, pretrained=True).cuda().train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-4)
     for _ in range(200):
         with torch.autocast('cuda', dtype=torch.bfloat16):

@@ -110,6 +110,8 @@ def predict_holdout(weights, root, size, batch):
 
 def main():
     args = parse_args()
+    if not hasattr(np, 'trapz'):  # gone from newer numpy; Ultralytics 8.3.100's mAP (utils/metrics.py) still calls it
+        np.trapz = np.trapezoid
     from ultralytics import YOLO
     run_dir = args.out / f'{args.name}_{time.strftime("%Y%m%d-%H%M%S")}'
     run_dir.mkdir(parents=True)

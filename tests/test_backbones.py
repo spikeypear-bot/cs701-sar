@@ -46,3 +46,16 @@ def test_convnext_pretrained_weights_are_loaded():
                               for p in (True, True, False))
     assert all(torch.equal(first[k], second[k]) for k in first)
     assert not any(torch.equal(first[k], scratch[k]) for k in first if 'norm' not in k)  # norms init at 1 and 0
+
+
+def test_convnext_trains_under_bf16():
+    """As train.py runs it: bf16 autocast, drop path, MoE-LoRA, forward and backward (job 338636 failed here in cuDNN)."""
+    from sarbench.adapters import add_adapters
+    backbone = build_backbone('convnext_b', pretrained=False, drop_path=0.6)
+    add_adapters(backbone, 'moelora')
+    backbone.cuda().train()
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        maps = backbone(torch.randn(16, 1, 512, 512, device='cuda'))
+    sum(m.float().mean() for m in maps).backward()
+    # task 0's routers only: task 1's are unused in this pass
+    assert all(p.grad is not None for n, p in backbone.named_parameters() if p.requires_grad and 'routers.1' not in n)

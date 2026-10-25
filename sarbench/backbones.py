@@ -111,6 +111,12 @@ class ConvNeXt(nn.Module):
         self.embed_dim = self.channels[-1]
         # New, not pretrained: add_adapters keeps them trainable
         self.out_norms = nn.ModuleList(timm.layers.LayerNorm2d(c) for c in self.channels)
+        # The convs get permuted views (the blocks' and LayerNorm2d's permute back from [B, H, W, C]), on which cuDNN
+        # (torch 2.9.0, bf16 autocast) failed with CUDNN_STATUS_BAD_PARAM in the depthwise conv (job 338636); a plain
+        # contiguous [B, C, H, W] copy is the layout every other conv here gets
+        for conv in self.convnext.modules():
+            if isinstance(conv, nn.Conv2d):
+                conv.register_forward_pre_hook(lambda module, args: (args[0].contiguous(),))
 
     @property
     def blocks(self):

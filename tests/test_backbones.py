@@ -27,3 +27,22 @@ def test_pretrained_weights_are_loaded(name):
     first, second, scratch = (dict(build_backbone(name, p).named_parameters()) for p in (True, True, False))
     assert all(torch.equal(first[k], second[k]) for k in first)  # no weight left at a random init
     assert not any(torch.equal(first[k], scratch[k]) for k in first)  # nor at the scratch init
+
+
+@pytest.mark.parametrize('pretrained', [True, False])
+def test_convnext_maps(pretrained):
+    backbone = build_backbone('convnext_b', pretrained, drop_path=0.6).cuda().eval()
+    with torch.no_grad():
+        maps = backbone(torch.randn(2, 1, 512, 512, device='cuda'))
+    assert [m.shape for m in maps] == [(2, c, 512 // s, 512 // s)
+                                       for c, s in zip((128, 256, 512, 1024), (4, 8, 16, 32))]
+    assert all(m.isfinite().all() for m in maps)
+    assert len(backbone.blocks) == 36 and backbone.embed_dim == 1024
+
+
+def test_convnext_pretrained_weights_are_loaded():
+    """Every timm weight is the published one; only the new output norms start at LayerNorm's init."""
+    first, second, scratch = (dict(build_backbone('convnext_b', p).convnext.named_parameters())
+                              for p in (True, True, False))
+    assert all(torch.equal(first[k], second[k]) for k in first)
+    assert not any(torch.equal(first[k], scratch[k]) for k in first if 'norm' not in k)  # norms init at 1 and 0

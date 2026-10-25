@@ -55,4 +55,6 @@ sbatch --time=10:00:00 train.slurm --backbone yolov8m --init pretrained --adapt 
 sbatch train.slurm --backbone yolov8m-p2 --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-p2-e48
 # Ultralytics' own trainer + default recipe (EMA, mosaic, scale/translate, warmup, AdamW auto lr), YOLOv8m COCO, 512 px, 48 ep, detection only; holdout scored as train.py does; vs yolov8m-e48 (41.89 mAP)
 sbatch train.slurm ultralytics_baseline.py --model yolov8m --epochs 48 --name ul-yolov8m-e48
+# ConvNeXt-B (ImageNet-22k) + FPN + Faster R-CNN, the ConvNeXt paper's detection recipe (AdamW 1e-4, wd 0.05, drop path 0.6, 36 ep, lr x0.1 at 27 and 33); MoE-LoRA on every block's MLP + last 2 blocks (stage 4) trained at 8e-5 (= 1e-4 x the paper's layer decay 0.8), ~37.8 M trainable; vs swin_b-moelora-e36 (33.2)
+sbatch --gres=gpu:l40s:1 --time=08:00:00 train.slurm --backbone convnext_b --init pretrained --adapt moelora --unfreeze-blocks 34-35 --unfreeze-lr 8e-5 --lr 1e-4 --weight-decay 0.05 --drop-path 0.6 --schedule step --epochs 36 --name convnext_b-moelora-uf34-e36
 ```

@@ -217,7 +217,8 @@ class MultiTaskModel(nn.Module):
 
 
 class SwinMultiTaskModel(MultiTaskModel):
-    """MultiTaskModel on a Swin backbone: its 4 real maps (strides 4-32) go through an FPN instead of the ViTDet neck.
+    """MultiTaskModel on a Swin or ConvNeXt backbone: its 4 real maps (strides 4-32) go through an FPN instead of the
+    ViTDet neck.
     The classification head, anchors and detector are MultiTaskModel's, unchanged. fgfm_levels (e.g. [0, 1, 2])
     puts foreground-guided feature modulation on those FPN levels (sarbench/fgfm.py); it runs at inference too."""
 

@@ -64,6 +64,34 @@ def test_lora_tokens_do_not_depend_on_task(name):
     assert torch.equal(task0, task1)
 
 
+# ConvNeXt-B: adapters on mlp.fc1 (C -> 4C) and mlp.fc2 (4C -> C); sum of C over its 36 blocks 18,048. LoRA rank 16:
+# 160 C per block; MoE-LoRA: 128 C of A and B plus 2 routers x (C + 4C) x 4 experts = 200 C; plus the output norms
+CONVNEXT_TRAINABLE = {'lora': 160 * 18_048 + 3_840, 'moelora': 200 * 18_048 + 3_840}
+
+
+@pytest.mark.parametrize('kind', ['lora', 'moelora'])
+def test_convnext_adapters(kind):
+    """No-ops at init; only the adapters and the new output norms train."""
+    backbone = build_backbone('convnext_b', pretrained=True)
+    x = torch.randn(2, 1, 512, 512, device='cuda')
+    before = tokens(backbone, x)
+    add_adapters(backbone, kind)
+    assert all((a - b).abs().max() <= 1e-5 for a, b in zip(tokens(backbone, x), before))
+    trainable = {n: p.numel() for n, p in backbone.named_parameters() if p.requires_grad}
+    assert all(n.endswith(ADAPTER_WEIGHTS) or n.startswith('out_norms.') for n in trainable)
+    assert sum(trainable.values()) == CONVNEXT_TRAINABLE[kind]
+
+
+def test_convnext_recipe_fits_the_limit():
+    """MoE-LoRA + the last 2 blocks (stage 4) unfrozen + FPN and Faster R-CNN: under 40 M trainable."""
+    from sarbench.model import SwinMultiTaskModel
+    backbone = build_backbone('convnext_b', pretrained=False)
+    add_adapters(backbone, 'moelora')
+    unfreeze_blocks(backbone, [34, 35])
+    model = SwinMultiTaskModel(backbone, task_routing=True)
+    assert sum(p.numel() for p in model.parameters() if p.requires_grad) < 40e6
+
+
 def test_moelora_is_a_gated_sum_of_lora_experts():
     """The stacked down/up layers compute y = W x + (alpha / r) * sum_e g_e(x) B_e A_e x."""
     # 3 experts of rank 2 (unequal, so mixing up the two axes fails); alpha / r = 2

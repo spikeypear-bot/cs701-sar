@@ -1,5 +1,5 @@
 """The backbones, built for 512 px input (img_size: another size, a multiple of 32). The two ViT-B/16: images [B, 1, 512, 512] -> patch tokens [B, 1024, 768].
-Swin: images [B, 1, 512, 512] -> 4 feature maps at strides 4, 8, 16 and 32. in_chans > 1 (ViT, Swin): input channels
+Swin and ConvNeXt: images [B, 1, 512, 512] -> 4 feature maps at strides 4, 8, 16 and 32. in_chans > 1: input channels
 from SAR filters (data.input_channels); in_chans=3 keeps the RGB patch-embedding weights as they are."""
 import timm
 from terratorch.registry import BACKBONE_REGISTRY
@@ -91,10 +91,49 @@ class Swin(nn.Module):
         return [m.permute(0, 3, 1, 2) for m in self.swin(x)]  # timm gives [B, H, W, C]; the FPN takes [B, C, H, W]
 
 
-def build_backbone(name, pretrained, in_chans=1, img_size=512):
-    """name: 'vit', 'terramind' or a key of SWIN_MODELS. pretrained=False builds the same architecture with random
-    weights. in_chans: input channels (ViT and Swin; TerraMind takes the gray image only). img_size: input side in
-    pixels (ViT and Swin; TerraMind takes 512 only)."""
+# --backbone name -> timm model. ImageNet-22k weights without the 1k fine-tuning, as the ConvNeXt paper's detection
+# models (Liu et al., CVPR 2022, the official Cascade Mask R-CNN ConvNeXt-B config: convnext_base_22k_224.pth)
+CONVNEXT_MODELS = {'convnext_b': 'convnext_base.fb_in22k'}
+
+
+class ConvNeXt(nn.Module):
+    """A timm ConvNeXt, its 4 stages as feature maps [B, C_i, 512 / s, 512 / s] for s = 4, 8, 16, 32, each through a
+    new LayerNorm as in the paper's detection backbone (the official object_detection/backbone/convnext.py norm0-3).
+    Fully convolutional: any multiple of 32 works as the input size. drop_path: stochastic depth rate, rising
+    linearly over the blocks to this value (paper, ConvNeXt-B Cascade Mask R-CNN: 0.6)."""
+    adapter_targets = ('mlp.fc1', 'mlp.fc2')  # the block's two 1 x 1 layers (nn.Linear on [B, H, W, C]); no attention
+
+    def __init__(self, pretrained: bool, name: str, in_chans=1, drop_path=0.0):
+        super().__init__()
+        self.convnext = timm.create_model(name, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3),
+                                          in_chans=in_chans, drop_path_rate=drop_path)  # 1: timm sums the RGB stem
+        self.channels = self.convnext.feature_info.channels()  # ConvNeXt-B [128, 256, 512, 1024]
+        self.embed_dim = self.channels[-1]
+        # New, not pretrained: add_adapters keeps them trainable
+        self.out_norms = nn.ModuleList(timm.layers.LayerNorm2d(c) for c in self.channels)
+
+    @property
+    def blocks(self):
+        """Every block of the 4 stages, for add_adapters and --unfreeze-blocks (ConvNeXt-B: 0-2 stage 1, 3-5 stage 2,
+        6-32 stage 3, 33-35 stage 4)."""
+        return [blk for i in range(4) for blk in self.convnext[f'stages_{i}'].blocks]
+
+    @property
+    def patch_embed(self):
+        """The input layer (4 x 4 conv + LayerNorm), the only one that sees the input channels."""
+        return nn.ModuleList([self.convnext['stem_0'], self.convnext['stem_1']])
+
+    def forward(self, x):
+        return [norm(m) for norm, m in zip(self.out_norms, self.convnext(x))]  # already [B, C, H, W]
+
+
+def build_backbone(name, pretrained, in_chans=1, img_size=512, drop_path=0.0):
+    """name: 'vit', 'terramind' or a key of SWIN_MODELS or CONVNEXT_MODELS. pretrained=False builds the same
+    architecture with random weights. in_chans: input channels (ViT, Swin and ConvNeXt; TerraMind takes the gray image
+    only). img_size: input side in pixels (ViT and Swin; ConvNeXt takes any; TerraMind takes 512 only). drop_path:
+    ConvNeXt only, see ConvNeXt."""
+    if name in CONVNEXT_MODELS:
+        return ConvNeXt(pretrained, CONVNEXT_MODELS[name], in_chans, drop_path)
     if name in SWIN_MODELS:
         return Swin(pretrained, SWIN_MODELS[name], in_chans, img_size)
     if name == 'terramind':

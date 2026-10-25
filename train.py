@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from sarbench.adapters import add_adapters, unfreeze_blocks
-from sarbench.backbones import SWIN_MODELS, build_backbone
+from sarbench.backbones import CONVNEXT_MODELS, SWIN_MODELS, build_backbone
 from sarbench.data import CHANNELS, SARMultiTask, channel_stats, collate, to_original_xywh
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import DETECTORS, RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
@@ -56,7 +56,8 @@ def parse_loss_weights(spec):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, default=Path(__file__).resolve().parents[1] / 'dataset' / 'SARFact-Course-20K')
-    p.add_argument('--backbone', required=True, choices=['vit', 'terramind', *SWIN_MODELS, *YOLO_MODELS],
+    p.add_argument('--backbone', required=True,
+                   choices=['vit', 'terramind', *SWIN_MODELS, *CONVNEXT_MODELS, *YOLO_MODELS],
                    help='a YOLO model is the whole detector, its own neck and head included (sarbench/yolo.py); it '
                         'takes --adapt full only')
     p.add_argument('--init', required=True, choices=['pretrained', 'scratch'])
@@ -103,6 +104,9 @@ def parse_args():
     p.add_argument('--ssl-weights', type=Path,
                    help='ssl.pt of pretrain_ssl.py: its SimMIM-trained LoRA adapters (and blocks) go on the backbone, '
                         'frozen and unmerged, under the --adapt adapters; Swin, LoRA/MoE-LoRA and raw input only')
+    p.add_argument('--drop-path', type=float, default=0.0,
+                   help='ConvNeXt only: stochastic depth rate, rising linearly over the blocks to this value (the '
+                        'ConvNeXt paper, ConvNeXt-B Cascade Mask R-CNN: 0.6; default: 0)')
     p.add_argument('--freeze-layers', type=int, default=0,
                    help='YOLO only: freeze its layers 0..N-1, as Ultralytics\' freeze=N (yolov8l: 6 is the least that '
                         'keeps it under 40 M trainable, 39.7 M; yolov8l-p2: 6 too, 38.9 M; default: 0)')
@@ -141,6 +145,9 @@ def parse_args():
     p.add_argument('--accum-steps', type=int, default=1,
                    help='optimizer step every N batches, gradients summed over them: --batch-size 8 --accum-steps 2 '
                         'trains as batch 16 in half the memory (default: 1)')
+    p.add_argument('--schedule', choices=['cosine', 'step'], default='cosine',
+                   help='after one epoch of linear warmup: cosine decay to 0, or the ConvNeXt paper\'s step schedule, '
+                        'lr x 0.1 at 3/4 and 11/12 of the epochs (27 and 33 of 36) (default: cosine)')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--backbone-lr', type=float, help='for the trainable backbone parameters (default: --lr)')
     p.add_argument('--weight-decay', type=float, default=0.05)
@@ -186,6 +193,8 @@ def parse_args():
                                          or args.rpn_match != 'iou' or args.heatmap_weight or args.train_patch_embed):
         p.error('a YOLO backbone takes --adapt full and none of --detector, --rpn-match, --heatmap-weight, '
                 '--train-patch-embed: it is a whole detector of its own')
+    if args.drop_path and args.backbone not in CONVNEXT_MODELS:
+        p.error('--drop-path is for the ConvNeXt backbones')
     if args.freeze_layers and args.backbone not in YOLO_MODELS:
         p.error('--freeze-layers is for the YOLO backbones')
     if not set(args.loss_weights) <= set(MAIN_LOSSES):
@@ -211,10 +220,13 @@ def make_loader(args, split):
                       persistent_workers=train and args.workers > 0)  # training workers live across epochs
 
 
-def lr_factor(step, warmup, total):
-    """Learning-rate multiplier: linear warmup over `warmup` steps, then cosine decay to 0 at step `total`."""
+def lr_factor(step, warmup, total, milestones=None):
+    """Learning-rate multiplier: linear warmup over `warmup` steps, then cosine decay to 0 at step `total`, or, with
+    milestones (steps), x 0.1 at each milestone passed."""
     if step < warmup:
         return (step + 1) / warmup
+    if milestones is not None:
+        return 0.1 ** sum(step >= m for m in milestones)
     return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))  # --epochs 1: no decay phase
 
 
@@ -321,7 +333,8 @@ def main():
         log(f'{args.backbone}: {model.transferred} tensors from the COCO weights', log_file)
     else:
         backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
-                                  in_chans=len(args.input_channels.split(',')), img_size=args.image_size)
+                                  in_chans=len(args.input_channels.split(',')), img_size=args.image_size,
+                                  drop_path=args.drop_path)
         if args.ssl_weights:  # before the task adapters, which wrap the SSL ones
             checkpoint = torch.load(args.ssl_weights, map_location='cpu')
             if checkpoint['backbone'] != args.backbone:
@@ -336,7 +349,8 @@ def main():
             if args.train_patch_embed:
                 backbone.patch_embed.requires_grad_(True)  # trained at --backbone-lr with the adapters
             unfrozen = unfreeze_blocks(backbone, args.unfreeze_blocks)  # trained at --unfreeze-lr
-        model_class = SwinMultiTaskModel if args.backbone in SWIN_MODELS else MultiTaskModel
+        multiscale = args.backbone in SWIN_MODELS or args.backbone in CONVNEXT_MODELS  # 4 maps -> FPN
+        model_class = SwinMultiTaskModel if multiscale else MultiTaskModel
         fgfm = dict(fgfm_levels=args.fgfm_levels, fgfm_alpha=args.fgfm_alpha) if args.fgfm_levels else {}  # Swin only
         model = model_class(backbone, task_routing=args.adapt == 'moelora', heatmap=args.heatmap_weight > 0,
                             heatmap_min_sigma=args.heatmap_min_sigma, rpn_match=args.rpn_match, nwd_c=args.nwd_c,
@@ -364,7 +378,10 @@ def main():
     optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = math.ceil(len(train_loader) / args.accum_steps)  # optimizer steps
     warmup, total = steps_per_epoch, args.epochs * steps_per_epoch  # one epoch of warmup
-    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, warmup, total))
+    # step: the paper's epochs 27 and 33 of 36 (mmdet lr_config step=[27, 33]), as shares of --epochs
+    milestones = [args.epochs * 3 // 4 * steps_per_epoch,
+                  args.epochs * 11 // 12 * steps_per_epoch] if args.schedule == 'step' else None
+    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, warmup, total, milestones))
 
     # Train, validating every --eval-every epochs; the reported model is the last-epoch model
     history, start = [], time.time()

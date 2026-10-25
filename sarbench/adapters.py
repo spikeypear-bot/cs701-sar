@@ -51,15 +51,21 @@ class MoELoRA(nn.Module):
 
 
 def add_adapters(backbone, kind, rank=None):
-    """Freeze the backbone, then wrap attn.qkv and attn.proj of every block (kind: 'lora' or 'moelora').
+    """Freeze the backbone, then wrap the layers backbone.adapter_targets names in every block (default: attn.qkv and
+    attn.proj; ConvNeXt: mlp.fc1 and mlp.fc2) (kind: 'lora' or 'moelora'). New modules of the backbone
+    (backbone.out_norms, ConvNeXt) stay trainable.
     rank: of each adapter (MoE-LoRA: of each expert); None keeps the defaults. alpha is 2 x rank, as in the defaults,
     so alpha / r stays 2."""
     adapter = {'lora': LoRA, 'moelora': MoELoRA}[kind]
     options = {} if rank is None else {'rank': rank, 'alpha': 2 * rank}
     backbone.requires_grad_(False)
+    if hasattr(backbone, 'out_norms'):
+        backbone.out_norms.requires_grad_(True)
     for blk in backbone.blocks:
-        blk.attn.qkv = adapter(blk.attn.qkv, **options)
-        blk.attn.proj = adapter(blk.attn.proj, **options)
+        for target in getattr(backbone, 'adapter_targets', ('attn.qkv', 'attn.proj')):
+            parent, _, name = target.rpartition('.')
+            parent = blk.get_submodule(parent)
+            setattr(parent, name, adapter(getattr(parent, name), **options))
 
 
 def unfreeze_blocks(backbone, indices):

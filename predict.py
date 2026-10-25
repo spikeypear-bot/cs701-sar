@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from make_submission import write_submission
 from sarbench.adapters import add_adapters
-from sarbench.backbones import SWIN_MODELS, build_backbone
+from sarbench.backbones import CONVNEXT_MODELS, SWIN_MODELS, build_backbone
 from sarbench.data import SARImages, collate_images
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import MultiTaskModel, SwinMultiTaskModel
@@ -77,7 +77,8 @@ def load_model(run):
         add_adapters(backbone, 'lora', options['ssl_rank'])
     if options['adapt'] != 'full':
         add_adapters(backbone, options['adapt'], options.get('lora_rank'))  # runs before --lora-rank: the default
-    model_class = SwinMultiTaskModel if options['backbone'] in SWIN_MODELS else MultiTaskModel
+    multiscale = options['backbone'] in SWIN_MODELS or options['backbone'] in CONVNEXT_MODELS  # 4 maps -> FPN
+    model_class = SwinMultiTaskModel if multiscale else MultiTaskModel
     # FGFM runs at inference, so it is rebuilt; runs from before --fgfm-levels have no such option
     fgfm = {k: options[k] for k in ('fgfm_levels', 'fgfm_alpha')} if options.get('fgfm_levels') else {}
     # Runs from before --detector are Faster R-CNN; no heatmap head: training only

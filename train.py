@@ -5,7 +5,9 @@ import copy
 import csv
 import json
 import math
+import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -25,6 +27,7 @@ from sarbench.yolo import CLS_HEADS, CLS_HIDDEN, CLS_POOLS, YOLO_MODELS, YOLOMul
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
 REF_F1, REF_MAP = 0.9399, 0.2541
+RESUME_EXIT = 75  # EX_TEMPFAIL: stopped for --stop-hours, with a checkpoint to --resume from (train.slurm requeues)
 # Cross-entropy of the image class, then the detector's losses: Faster R-CNN's (RPN, then RoI heads), RetinaNet's or
 # YOLO's (sarbench/yolo.py)
 MAIN_LOSSES = ('classification', 'loss_objectness', 'loss_rpn_box_reg', 'loss_classifier', 'loss_box_reg',
@@ -55,6 +58,13 @@ def parse_loss_weights(spec):
 
 
 def parse_args():
+    # --resume: every other option comes from the run's checkpoint, except --stop-hours (the new job's own limit)
+    first = argparse.ArgumentParser(add_help=False)
+    first.add_argument('--resume', type=Path)
+    first.add_argument('--stop-hours', type=float)
+    known, _ = first.parse_known_args()
+    if known.resume:
+        return known
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, default=Path(__file__).resolve().parents[1] / 'dataset' / 'SARFact-Course-20K')
     p.add_argument('--backbone', required=True,
@@ -186,6 +196,16 @@ def parse_args():
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--out', type=Path, default=Path('runs'))
     p.add_argument('--name', help='run name; the run folder is <out>/<name>_<time> (default: backbone_init_adapt)')
+    p.add_argument('--checkpoint-every', type=int, default=4,
+                   help='save checkpoint.pt (weights, optimizer, schedule, EMA, RNG) in the run folder every N epochs; '
+                        '0: only when stopping for --stop-hours. Removed when the run finishes (default: 4)')
+    p.add_argument('--stop-hours', type=float,
+                   help='after an epoch, save checkpoint.pt and exit with code 75 if the next epoch and the final '
+                        'scoring might end past this many hours from the start (train.slurm sets it from the job\'s '
+                        'time limit and requeues the job)')
+    p.add_argument('--resume', type=Path,
+                   help='continue the run in this folder from its checkpoint.pt, with the run\'s own options (any '
+                        'others given are ignored, except --stop-hours)')
     args = p.parse_args()
     if args.init == 'scratch' and args.adapt != 'full':
         p.error('--init scratch is only valid with --adapt full')
@@ -233,6 +253,8 @@ def parse_args():
         p.error('--small-box-assign, --cls-pool, --cls-head and --cls-dropout are for the YOLO backbones')
     if not all(0 <= v < 1 for v in (args.ema, args.cls_dropout, args.label_smoothing, args.brightness)):
         p.error('--ema, --cls-dropout, --label-smoothing and --brightness take 0 to less than 1')
+    if args.checkpoint_every < 0:
+        p.error('--checkpoint-every takes 0 or more')
     return args
 
 
@@ -364,6 +386,21 @@ def save_code_version(run_dir):
     return git('rev-parse', 'HEAD').strip() or None, bool(diff)
 
 
+def save_checkpoint(run_dir, args, code, epoch, model, optimizer, schedule, ema, history, train_seconds):
+    """What --resume needs to continue after `epoch`: the weights, the optimizer and schedule states, the EMA copy,
+    the random number generators, the validation history, the options and the code version (data-loading workers
+    restart with new seeds, so the augmentations differ from an unbroken run). Written to a temporary file first, so
+    a job killed while saving keeps the previous checkpoint."""
+    state = {'args': vars(args), 'code': code, 'epoch': epoch, 'model': model.state_dict(),
+             'optimizer': optimizer.state_dict(), 'schedule': schedule.state_dict(),
+             'ema': ema.model.state_dict() if ema else None, 'ema_updates': ema.updates if ema else 0,
+             'rng': torch.get_rng_state(), 'cuda_rng': torch.cuda.get_rng_state_all(),
+             'history': history, 'train_seconds': train_seconds}
+    temporary = run_dir / 'checkpoint.pt.tmp'
+    torch.save(state, temporary)
+    temporary.replace(run_dir / 'checkpoint.pt')
+
+
 def append_results(summary, path):
     """One row per run in a table shared by all runs. Δm is rough here: the reference was scored on the
     official test split, our numbers on the local holdout."""
@@ -383,19 +420,32 @@ def append_results(summary, path):
 
 
 def main():
+    process_start = time.time()  # for --stop-hours
     args = parse_args()
-    torch.manual_seed(args.seed)
-    name = args.name or f'{args.backbone}_{args.init}_{args.adapt}'
-    run_dir = args.out / f'{name}_{time.strftime("%Y%m%d-%H%M%S")}'  # a new folder per run: nothing is overwritten
-    run_dir.mkdir(parents=True)
-    log_file = open(run_dir / 'log.txt', 'w')
-    log(json.dumps(vars(args), default=str), log_file)
-    commit, dirty = save_code_version(run_dir)
-    log(f'code: commit {commit}' + (', with uncommitted changes (code.diff)' if dirty else ''), log_file)
+    resume_state = None
+    if args.resume:  # the run's own options; its folder, log and code version carry on
+        resume_state = torch.load(args.resume / 'checkpoint.pt', map_location='cpu', weights_only=False)
+        args = argparse.Namespace(**{**resume_state['args'], 'resume': args.resume, 'stop_hours': args.stop_hours})
+        run_dir, (commit, dirty) = args.resume, resume_state['code']
+        log_file = open(run_dir / 'log.txt', 'a')
+        now = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip() or None
+        log(f'resumed after epoch {resume_state["epoch"]} of {args.epochs}'
+            + ('' if now == commit else f'; WARNING: the code is now at commit {now}, the run started at {commit}'),
+            log_file)
+    else:
+        torch.manual_seed(args.seed)
+        name = args.name or f'{args.backbone}_{args.init}_{args.adapt}'
+        run_dir = args.out / f'{name}_{time.strftime("%Y%m%d-%H%M%S")}'  # a new folder per run: nothing overwritten
+        run_dir.mkdir(parents=True)
+        log_file = open(run_dir / 'log.txt', 'w')
+        log(json.dumps(vars(args), default=str), log_file)
+        commit, dirty = save_code_version(run_dir)
+        log(f'code: commit {commit}' + (', with uncommitted changes (code.diff)' if dirty else ''), log_file)
+        # The input channels' mean and std are saved with the run (metrics.json args), for predict.py
+        args.channel_stats = channel_stats(args.data, args.input_channels.split(','))
+        log(f'input channels {args.input_channels}: mean, std {args.channel_stats}', log_file)
 
-    # Data. The input channels' mean and std are saved with the run (metrics.json args), for predict.py
-    args.channel_stats = channel_stats(args.data, args.input_channels.split(','))
-    log(f'input channels {args.input_channels}: mean, std {args.channel_stats}', log_file)
+    # Data
     train_loader, val_loader, test_loader = (make_loader(args, split) for split in ('train', 'val', 'test'))
 
     # Model: adapters are created on the CPU, so they are added before .cuda()
@@ -466,9 +516,24 @@ def main():
     if ema:
         log(f'EMA: decay {args.ema}, tau {ema.tau} steps; validation, test and model.pt use the EMA weights', log_file)
 
+    first_epoch, history, train_seconds = 1, [], 0.0
+    if resume_state:
+        model.load_state_dict(resume_state['model'])
+        optimizer.load_state_dict(resume_state['optimizer'])
+        schedule.load_state_dict(resume_state['schedule'])
+        if ema:
+            ema.model.load_state_dict(resume_state['ema'])
+            ema.updates = resume_state['ema_updates']
+        torch.set_rng_state(resume_state['rng'])
+        torch.cuda.set_rng_state_all(resume_state['cuda_rng'])
+        first_epoch, history, train_seconds = (resume_state['epoch'] + 1, resume_state['history'],
+                                               resume_state['train_seconds'])
+        del resume_state  # the CPU copies of the weights and optimizer states
+
     # Train, validating every --eval-every epochs; the reported model is the last-epoch model
-    history, start = [], time.time()
-    for epoch in range(1, args.epochs + 1):
+    longest = 0.0  # the longest epoch (training + validation) in this job, for --stop-hours
+    for epoch in range(first_epoch, args.epochs + 1):
+        epoch_start = time.time()
         train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file,
                         {'heatmap': args.heatmap_weight, 'foreground': args.fgfm_loss_weight, **args.loss_weights},
                         args.accum_steps, args.label_smoothing, ema)
@@ -477,7 +542,21 @@ def main():
                                            args.image_size)
             history.append({'epoch': epoch, **val})
             log(f'epoch {epoch} val: {headline(val)}', log_file)
-    train_hours = (time.time() - start) / 3600
+        took = time.time() - epoch_start
+        train_seconds, longest = train_seconds + took, max(longest, took)
+        if epoch < args.epochs:
+            # 2 x the longest epoch: the next epoch, then the test scoring and saving
+            stop = args.stop_hours is not None and time.time() - process_start + 2 * longest > args.stop_hours * 3600
+            if stop or (args.checkpoint_every and epoch % args.checkpoint_every == 0):
+                save_checkpoint(run_dir, args, (commit, dirty), epoch, model, optimizer, schedule, ema, history,
+                                train_seconds)
+            if stop:
+                log(f'stopped after epoch {epoch}: the next might end past --stop-hours {args.stop_hours}; '
+                    f'checkpoint.pt saved, continue with --resume {run_dir}', log_file)
+                if os.environ.get('RESUME_NOTE'):  # set by train.slurm, which requeues the job
+                    Path(os.environ['RESUME_NOTE']).write_text(str(run_dir))
+                sys.exit(RESUME_EXIT)
+    train_hours = train_seconds / 3600
 
     # Evaluate on test, once
     test, test_detections = evaluate(final_model, test_loader, args.data / 'detection' / 'instances_test.json',
@@ -495,6 +574,7 @@ def main():
     (run_dir / 'predictions_val.json').write_text(json.dumps(val_detections))
     (run_dir / 'predictions_test.json').write_text(json.dumps(test_detections))
     torch.save(final_model.state_dict(), run_dir / 'model.pt')
+    (run_dir / 'checkpoint.pt').unlink(missing_ok=True)  # model.pt is the result; a checkpoint is ~4 x its size
     append_results(summary, args.out / 'results.csv')
 
 

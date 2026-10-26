@@ -6,7 +6,7 @@ import pytest
 
 from sarbench.metrics import classification_metrics, detection_metrics
 
-ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
+ROOT = Path(__file__).resolve().parents[1] / 'data'  # make_split.py's split, as train.slurm's --data data
 
 
 def test_classification_metrics_by_hand():

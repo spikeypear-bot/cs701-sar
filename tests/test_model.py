@@ -13,7 +13,7 @@ from sarbench.metrics import detection_metrics
 from sarbench.model import (RPN_MATCH, MultiTaskModel, SwinMultiTaskModel, anchor_similarity, gaussian_heatmaps,
                             heatmap_loss)
 
-ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
+ROOT = Path(__file__).resolve().parents[1] / 'data'  # make_split.py's split, as train.slurm's --data data
 
 
 def first_train_images(n):

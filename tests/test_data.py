@@ -14,14 +14,14 @@ from sarbench.data import (MEAN, STD, BoxPaste, SARMultiTask, collate, input_cha
                            random_crop, rot90, to_original_xywh)
 from sarbench.metrics import detection_metrics
 
-ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
+ROOT = Path(__file__).resolve().parents[1] / 'data'  # make_split.py's split, as train.slurm's --data data
 
 
 def batches(split):
     return DataLoader(SARMultiTask(ROOT, split), batch_size=64, collate_fn=collate)
 
 
-@pytest.mark.parametrize('split, size', [('train', 9392), ('val', 1426), ('test', 2065)])
+@pytest.mark.parametrize('split, size', [('train', 8452), ('val', 940), ('test', 940)])
 def test_subset_a(split, size):
     loader = batches(split)
     assert len(loader.dataset) == size

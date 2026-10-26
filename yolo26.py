@@ -4,7 +4,7 @@ Albumentations (multiplicative noise, gamma, brightness/contrast) and any other 
 --hyp. Detection only: the image class is the class of the image's highest-scored box (every image holds one class).
 Needs a newer Ultralytics than train.py's 8.3.100, so it runs in its own conda env (train.slurm picks cs701y26 for
 this script; setup in docs/claude.md). Examples:
-  sbatch --gres=gpu:l40s:1 --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 \\
+  sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 \\
       --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --name y26x-p2-f5-8-e100
   python yolo26.py --predict runs/<run> cs701-sar-course-data/val/images.json   # -> <run>/submission_val.zip
 Writes runs/<name>_<time>/: Ultralytics' folder (ultralytics/, weights/last.pt saved every epoch), args.json,

@@ -7,3 +7,5 @@ logs/
 .env
 docs/claude.md
 submission*.zip
+docs/experiments.md
+docs/plans/

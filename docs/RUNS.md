@@ -76,5 +76,5 @@ sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 -
 # YOLOv8m e100, AdamW weight decay 0.05 on weights only (--no-decay-1d); vs yolov8m-e100 and yolov8m-wd0.01-e100
 sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 0.05 --no-decay-1d --epochs 100 --name yolov8m-wd0.05-e100
 # YOLO26x-P2 (Ultralytics 8.4.189 trainer and default recipe, env cs701y26), COCO yolo26x weights where shapes fit, layers 5-8 frozen (40 M limit), Albumentations multiplicative noise 1 +- 0.1, gamma 80-120, brightness/contrast 0.2 (p 0.5 each), 100 ep; image class = top box's class; as the groupmate's run (Codabench dm +41.16), vs yolov8m-e100
-sbatch --gres=gpu:l40s:1 --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --name y26x-p2-f5-8-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --name y26x-p2-f5-8-e100
 ```

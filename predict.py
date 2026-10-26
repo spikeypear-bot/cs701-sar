@@ -25,6 +25,36 @@ from sarbench.yolo import NMS, YOLO_MODELS, YOLOMultiTaskModel
 from train import headline
 
 
+CLASS_NAMES = ('aircraft', 'airport', 'bridge', 'car', 'harbor', 'oil_tank', 'playground', 'ship', 'wind_turbine')
+# the course categories, ids 1..9 = labels 0..8
+
+
+def parse_offsets(spec):
+    """'wind_turbine=0.5:0.3,ship=0.4:0.5' -> {8: (0.5, 0.3), 7: (0.4, 0.5)}: class label 0..8 -> (dx, dy)"""
+    offsets = {}
+    for part in filter(None, spec.split(',')):
+        name, _, xy = part.partition('=')
+        dx, _, dy = xy.partition(':')
+        if name.strip() not in CLASS_NAMES:
+            raise argparse.ArgumentTypeError(f'{name!r} is not one of {", ".join(CLASS_NAMES)}')
+        offsets[CLASS_NAMES.index(name.strip())] = (float(dx), float(dy))
+    return offsets
+
+
+def remove_offsets(preds, images, offsets, size):
+    """Move every box of a class in offsets by -(dx, dy) original pixels, onto where the true boxes sit on average:
+    preds as predict returns them (boxes XYXY on the size x size input), images as in images.json."""
+    for im in images:
+        label, boxes, classes, scores = preds[im['file_name']]
+        sx, sy = size / im['width'], size / im['height']  # original pixels -> input pixels
+        moved = []
+        for (x1, y1, x2, y2), c in zip(boxes, classes):
+            dx, dy = offsets.get(c, (0.0, 0.0))
+            moved.append([x1 - dx * sx, y1 - dy * sy, x2 - dx * sx, y2 - dy * sy])
+        preds[im['file_name']] = (label, moved, classes, scores)
+    return preds
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('run', type=Path, help='a run folder of train.py, with model.pt and metrics.json')
@@ -42,6 +72,10 @@ def parse_args():
     p.add_argument('--score-thresh', type=float, help='YOLO: lowest score kept (default: 0.001)')
     p.add_argument('--keypoint-centres', action='store_true',
                    help='YOLO runs with --centre-keypoint only: move each box onto its predicted centre keypoint')
+    p.add_argument('--box-offset', type=parse_offsets, default={},
+                   help='any run: per-class centre offsets of the predictions from the true boxes, in original '
+                        'pixels, as box_fit.py measures them (dx, dy: + = right, down), subtracted from every box of '
+                        'that class, e.g. wind_turbine=0.5:0.3,ship=0.4:0.5 (default: none)')
     p.add_argument('--class-filter', choices=('hard', 'soft'),
                    help='any run: keep only the boxes of the predicted image class (hard), or multiply each box score '
                         'by the image-class probability of its class (soft) (default: off)')
@@ -53,8 +87,9 @@ def parse_args():
                                           ('soft_sigma', args.soft_sigma), ('score_thresh', args.score_thresh),
                                           ('keypoint_centres', args.keypoint_centres or None))
                         if v is not None}
-    suffix = ''.join(f'_{k}-{v}' for k, v in (*args.postprocess.items(), ('class_filter', args.class_filter))
-                     if v is not None)
+    offsets = '+'.join(f'{CLASS_NAMES[c]}{dx:g}:{dy:g}' for c, (dx, dy) in args.box_offset.items()) or None
+    suffix = ''.join(f'_{k}-{v}' for k, v in (*args.postprocess.items(), ('class_filter', args.class_filter),
+                                              ('box_offset', offsets)) if v is not None)
     args.out = args.out or args.run / f'submission_{args.images.parent.name}{suffix}.zip'
     return args
 
@@ -139,6 +174,8 @@ def main():
     for name, value in args.postprocess.items():
         setattr(model, name, value)
     preds = predict(model, loader, args.class_filter)
+    if args.box_offset:
+        preds = remove_offsets(preds, dataset.images, args.box_offset, size)
     write_submission(dataset.images, preds, size=size, out=args.out)
     print(f'{len(preds)} images -> {args.out}')
     if 'annotations' in json.loads(args.images.read_text()):

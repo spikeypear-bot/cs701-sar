@@ -12,7 +12,7 @@ from predict import load_model
 from sarbench.data import to_original_xywh
 from sarbench.metrics import detection_metrics
 from sarbench.quadfpn import QUAD_FPN_PARTS
-from sarbench.yolo import YOLOMultiTaskModel, pretrained_state, soft_nms
+from sarbench.yolo import YOLOMultiTaskModel, enlarged_candidates, pretrained_state, soft_nms
 from test_model import ROOT, first_train_images, forward  # pytest puts tests/ on the path
 
 
@@ -144,6 +144,53 @@ def test_centre_keypoint_model_trains_on_box_centres_and_can_move_boxes_onto_the
     for a, b in zip(plain, moved):  # same detections, other places (sizes equal unless clipped)
         assert torch.allclose(a['scores'], b['scores']) and torch.equal(a['labels'], b['labels'])
         assert not torch.equal(a['boxes'], b['boxes'])
+
+
+def test_small_box_assign_gives_candidates_to_a_box_between_the_grid_points():
+    from ultralytics.utils.tal import TaskAlignedAssigner
+    select = TaskAlignedAssigner.select_candidates_in_gts
+    grid = torch.arange(4., 32, 8)  # stride-8 point centres 4, 12, 20, 28
+    points = torch.stack(torch.meshgrid(grid, grid, indexing='xy'), dim=-1).view(-1, 2)
+    boxes = torch.tensor([[[5., 5, 11, 11], [0, 0, 0, 0], [2, 2, 30, 30]]])  # 6 px between points, padding, large
+    plain, enlarged = select(points, boxes), enlarged_candidates(16, select)(points, boxes)
+    assert plain[0, 0].sum() == 0 and enlarged[0, 0].sum() == 4  # widened to [0, 16]: points 4 and 12 in x and y
+    assert enlarged[0, 1].sum() == 0  # the padding stays empty
+    assert plain[0, 2].sum() == 16 and torch.equal(plain[0, 2], enlarged[0, 2])  # a large box is unchanged
+
+
+def test_small_box_assign_trains_and_patches_only_its_own_assigner():
+    images, _, targets = first_train_images(2)
+    model = YOLOMultiTaskModel('yolov8m', pretrained=True, small_box_assign=16).cuda().train()
+    _, _, losses = forward(model, images, targets)
+    assert all(loss.dtype == torch.float32 and loss.isfinite() and loss > 0 for loss in losses.values())
+    assert 'select_candidates_in_gts' in vars(model.criterion.assigner)
+    plain = YOLOMultiTaskModel('yolov8m', pretrained=False).cuda().train()
+    forward(plain, images, targets)
+    assert 'select_candidates_in_gts' not in vars(plain.criterion.assigner)
+
+
+def test_neck_pooled_mlp_head_trains_the_neck_and_predict_rebuilds_it(tmp_path):
+    model = YOLOMultiTaskModel('yolov8m', pretrained=False, cls_pool='neck', cls_head='mlp', cls_dropout=0.2).cuda()
+    assert model.cls_head[0].normalized_shape == (192 + 384 + 576,)
+    assert isinstance(model.cls_head[3], torch.nn.Dropout) and model.cls_head[-1].in_features == 512
+    images, labels, targets = first_train_images(2)
+    logits, _, _ = forward(model.train(), images, targets)
+    F.cross_entropy(logits, labels).backward()
+    p5_out = model.backbone.model[21]  # the neck's last C2f, after the SPPF: only reached through the neck maps
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in p5_out.parameters())
+    torch.save(model.state_dict(), tmp_path / 'model.pt')
+    (tmp_path / 'metrics.json').write_text(json.dumps({'args': {'backbone': 'yolov8m', 'adapt': 'full',
+                                                                'cls_pool': 'neck', 'cls_head': 'mlp',
+                                                                'cls_dropout': 0.2}}))
+    model.eval()
+    with torch.no_grad():
+        expected, rebuilt = forward(model, images), forward(load_model(tmp_path), images)
+    assert torch.allclose(expected[0], rebuilt[0])
+
+
+def test_plain_head_keeps_the_layout_of_older_runs():
+    assert list(YOLOMultiTaskModel('yolov8m', pretrained=False).cls_head.state_dict()) == [
+        '0.weight', '0.bias', '1.weight', '1.bias']
 
 
 @pytest.mark.parametrize('name', ['yolov8m', 'yolov8m-p2'])

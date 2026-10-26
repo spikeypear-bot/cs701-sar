@@ -68,7 +68,10 @@ def load_model(run):
         model = YOLOMultiTaskModel(options['backbone'], pretrained=False,
                                    in_chans=len(options.get('input_channels', 'raw').split(',')),
                                    quad_fpn=options.get('quad_fpn', []),  # runs before --quad-fpn: none
-                                   centre_keypoint=options.get('centre_keypoint', False))
+                                   centre_keypoint=options.get('centre_keypoint', False),
+                                   # runs before --cls-pool/--cls-head/--cls-dropout: the plain head
+                                   cls_pool=options.get('cls_pool', 'sppf'), cls_head=options.get('cls_head', 'linear'),
+                                   cls_dropout=options.get('cls_dropout', 0.0))
         model.load_state_dict(state)
         return model.cuda().eval()
     backbone = build_backbone(options['backbone'], pretrained=False,  # every weight comes from model.pt

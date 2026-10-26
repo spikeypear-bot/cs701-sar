@@ -54,7 +54,17 @@ sbatch --time=10:00:00 train.slurm --backbone yolov8m --init pretrained --adapt 
 # YOLOv8m-P2 (yolov8-p2.yaml: 4th Detect level at stride 4; COCO weights in layers 0-15 only, the P2 neck and head new; 25.1 M), 512 px; same recipe as yolov8m-e48, vs yolov8m-e48; ~1.25x compute
 sbatch train.slurm --backbone yolov8m-p2 --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --name yolov8m-p2-e48
 # Ultralytics' own trainer + default recipe (EMA, mosaic, scale/translate, warmup, AdamW auto lr), YOLOv8m COCO, 512 px, 48 ep, detection only; holdout scored as train.py does; vs yolov8m-e48 (41.89 mAP)
-sbatch train.slurm ultralytics_baseline.py --model yolov8m --epochs 48 --name ul-yolov8m-e48
+sbatch --mem=64GB train.slurm ultralytics_baseline.py --model yolov8m --epochs 48 --name ul-yolov8m-e48
 # ConvNeXt-B (ImageNet-22k) + FPN + Faster R-CNN, the ConvNeXt paper's detection recipe (AdamW 1e-4, wd 0.05, drop path 0.6, 36 ep, lr x0.1 at 27 and 33); MoE-LoRA on every block's MLP + last 2 blocks (stage 4) trained at 8e-5 (= 1e-4 x the paper's layer decay 0.8), ~37.8 M trainable; vs swin_b-moelora-e36 (33.2)
 sbatch --gres=gpu:l40s:1 --time=08:00:00 train.slurm --backbone convnext_b --init pretrained --adapt moelora --unfreeze-blocks 34-35 --unfreeze-lr 8e-5 --lr 1e-4 --weight-decay 0.05 --drop-path 0.6 --schedule step --epochs 36 --name convnext_b-moelora-uf34-e36
+# YOLOv8m all-on: weight EMA 0.9999 + YOLO26 small-box assignment (16 px) + image-class head on the neck maps (MLP, dropout 0.2) + label smoothing 0.1; yolov8m-e48 recipe otherwise, vs yolov8m-e48 (41.89 mAP, 93.8 F1); then leave-one-out
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --ema 0.9999 --small-box-assign 16 --cls-pool neck --cls-head mlp --cls-dropout 0.2 --label-smoothing 0.1 --name yolov8m-allon-e48
+# YOLOv8m with SGD (Nesterov, momentum 0.937, lr 0.01, no weight decay on 1-D parameters, as Ultralytics), yolov8m-e48 recipe otherwise, vs yolov8m-e48 (AdamW 1e-3)
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --optimizer sgd --lr 1e-2 --weight-decay 5e-4 --epochs 48 --name yolov8m-sgd-e48
+# YOLOv8m 200 epochs, yolov8m-e100 recipe otherwise (e48 41.89, e60 42.85, e100 44.80, Codabench +32); 8 h limit for headroom
+sbatch --time=08:00:00 train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 200 --name yolov8m-e200
+# YOLOv8m box loss gain x1.5 (7.5 -> 11.25), for tighter boxes (AP/AP50 0.64); vs yolov8m-e48
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --loss-weights loss_yolo_box=1.5 --name yolov8m-box1.5-e48
+# YOLOv8m DFL gain x2 (1.5 -> 3); vs yolov8m-e48
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --loss-weights loss_yolo_dfl=2 --name yolov8m-dfl2-e48
 ```

@@ -23,6 +23,33 @@ P2_SHARED_LAYERS = 16  # layers 0-15 of a -p2 model (backbone, top-down neck dow
 # from 16 on its layers are new (the P2 path) or the plain one's moved to other indices, so they start untrained
 NMS = ('hard', 'soft')
 SOFT_NMS_CANDIDATES = 3000  # highest-scored (box, class) pairs per image that Soft-NMS ranks
+CLS_POOLS = ('sppf', 'neck')  # what the image-class head averages: the SPPF map, or the neck maps Detect reads
+CLS_HEADS = ('linear', 'mlp')
+CLS_HIDDEN = 512  # width of the MLP head's hidden layer
+
+
+def enlarged_candidates(min_side, select):
+    """YOLO26's small-target-aware assignment (STAL; Ultralytics' current tal.py, not in 8.3.100): the task-aligned
+    assigner's candidate test `select` (TaskAlignedAssigner.select_candidates_in_gts: anchor points [anchors, 2] whose
+    centre lies inside a box of gt_bboxes [B, boxes, 4], XYXY, both in input pixels), with each box side below
+    min_side widened to min_side around the box centre first, so a box between the grid points still gets
+    candidates. Only the candidate test sees the widened boxes: the alignment metric and the box loss use the real
+    ones. Zero-size boxes (the assigner's padding, masked out after) stay as they are."""
+    def select_enlarged(xy_centers, gt_bboxes, eps=1e-9):
+        centre, wh = (gt_bboxes[..., :2] + gt_bboxes[..., 2:]) / 2, gt_bboxes[..., 2:] - gt_bboxes[..., :2]
+        wh = torch.where(wh > 0, wh.clamp(min=min_side), wh)
+        return select(xy_centers, torch.cat([centre - wh / 2, centre + wh / 2], dim=-1), eps)
+    return select_enlarged
+
+
+def classification_head(channels, num_classes, kind, dropout):
+    """LayerNorm -> Linear, or LayerNorm -> Linear -> GELU -> Linear (kind='mlp'), with dropout before the last
+    Linear. With dropout 0 there is no Dropout module, so the plain head keeps the layout of the runs before it."""
+    layers = [nn.LayerNorm(channels)]
+    if kind == 'mlp':
+        layers += [nn.Linear(channels, CLS_HIDDEN), nn.GELU()]
+    layers += [nn.Dropout(dropout)] if dropout else []
+    return nn.Sequential(*layers, nn.Linear(CLS_HIDDEN if kind == 'mlp' else channels, num_classes))
 
 
 def pretrained_state(name, in_chans):
@@ -93,11 +120,15 @@ class YOLOMultiTaskModel(nn.Module):
     keypoint_centres (inference, predict.py): each kept box is moved so that its centre is its predicted keypoint, its
     width and height kept. A -p2 name (yolov8m-p2): the same network with a fourth head level at stride 4; the COCO
     weights of the plain model go into its layers 0-15 only (P2_SHARED_LAYERS); neither quad_fpn nor centre_keypoint
-    (Ultralytics has no P2 pose model)."""
+    (Ultralytics has no P2 pose model). small_box_assign (px, training only): YOLO26's small-target-aware assignment
+    (enlarged_candidates), box sides below it widened for the assigner's candidate test (YOLO26: 16, its second
+    stride). cls_pool='neck': the image-class head averages each map Detect reads (P3-P5 after the neck) and joins
+    them, instead of the SPPF map alone; cls_head, cls_dropout: see classification_head."""
 
     def __init__(self, name, pretrained: bool, in_chans=1, num_classes=9, freeze_layers=0, score_thresh=0.001,
                  nms_thresh=0.7, detections_per_img=100, quad_fpn=(), nms='hard', soft_sigma=0.5,
-                 centre_keypoint=False, keypoint_centres=False):
+                 centre_keypoint=False, keypoint_centres=False, small_box_assign=0.0, cls_pool='sppf',
+                 cls_head='linear', cls_dropout=0.0):
         super().__init__()
         from ultralytics.nn.tasks import DetectionModel, PoseModel
         p2 = name.endswith('-p2')
@@ -124,8 +155,13 @@ class YOLOMultiTaskModel(nn.Module):
         layers[:freeze_layers].requires_grad_(False)
         # SPPF ends YOLOv8's backbone; YOLO11 has one attention block (C2PSA) after it
         self.sppf = next(m.i for m in layers if type(m).__name__ == 'SPPF')
-        channels = layers[self.sppf].cv2.conv.out_channels  # v8m: 576
-        self.cls_head = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, num_classes))
+        self.cls_pool = cls_pool
+        if cls_pool == 'neck':  # the input channels of Detect's box branch on each level; v8m: 192 + 384 + 576
+            channels = sum(branch[0].conv.in_channels for branch in layers[-1].cv2)
+        else:
+            channels = layers[self.sppf].cv2.conv.out_channels  # v8m: 576
+        self.cls_head = classification_head(channels, num_classes, cls_head, cls_dropout)
+        self.small_box_assign = small_box_assign
         self.quad_fpn = QuadFPN(layers, quad_fpn) if quad_fpn else None
         self.score_thresh, self.nms_thresh, self.detections_per_img = score_thresh, nms_thresh, detections_per_img
         self.nms, self.soft_sigma, self.keypoint_centres = nms, soft_sigma, keypoint_centres
@@ -154,6 +190,10 @@ class YOLOMultiTaskModel(nn.Module):
         if self.criterion is None:
             from ultralytics.utils.loss import v8DetectionLoss, v8PoseLoss
             self.criterion = (v8PoseLoss if self.centre_keypoint else v8DetectionLoss)(self.backbone)
+            if self.small_box_assign:  # an instance attribute: the assigner calls self.select_candidates_in_gts
+                assigner = self.criterion.assigner
+                assigner.select_candidates_in_gts = enlarged_candidates(self.small_box_assign,
+                                                                        assigner.select_candidates_in_gts)
         h, w = images.shape[-2:]
         batch = {'batch_idx': torch.cat([torch.full((len(t['boxes']),), i, device=images.device, dtype=torch.float32)
                                          for i, t in enumerate(targets)]),
@@ -198,12 +238,13 @@ class YOLOMultiTaskModel(nn.Module):
         Precision rule as model.py's: the head's convs run in the caller's bf16, as RetinaNet's, and its raw maps go to
         fp32 before boxes are decoded, so no coordinate snaps to bf16's 2 px grid near 512."""
         outputs, sppf = self.features(images)
-        logits = self.cls_head(sppf.mean(dim=(2, 3)))
         # Detect (Pose), on the P3, P4, P5 maps of the neck (strides 8, 16, 32); -p2: P2 (stride 4) to P5
         head = self.backbone.model[-1]
         maps = [outputs[j] for j in head.f]
         if self.quad_fpn is not None:
             maps = self.quad_fpn.head_inputs(maps)
+        pooled = [m.mean(dim=(2, 3)) for m in maps] if self.cls_pool == 'neck' else [sppf.mean(dim=(2, 3))]
+        logits = self.cls_head(torch.cat(pooled, dim=1))
         raw = [torch.cat((head.cv2[i](x), head.cv3[i](x)), 1) for i, x in enumerate(maps)]
         keypoints = (torch.cat([head.cv4[i](x).flatten(2) for i, x in enumerate(maps)], dim=2)  # [B, 2, anchors]
                      if self.centre_keypoint else None)

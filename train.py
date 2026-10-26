@@ -1,6 +1,7 @@
 """Train one model jointly for classification and detection, then score it on val and test.
 Example: python train.py --backbone vit --init pretrained --adapt lora"""
 import argparse
+import copy
 import csv
 import json
 import math
@@ -19,7 +20,7 @@ from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import DETECTORS, RPN_MATCH, MultiTaskModel, SwinMultiTaskModel
 from sarbench.quadfpn import QUAD_FPN_PARTS
 from sarbench.simmim import load_ssl
-from sarbench.yolo import YOLO_MODELS, YOLOMultiTaskModel
+from sarbench.yolo import CLS_HEADS, CLS_HIDDEN, CLS_POOLS, YOLO_MODELS, YOLOMultiTaskModel
 
 # Limits from Codabench (Terms), and the Δm reference: ViT + LoRA on test, mean of 3 seeds (README, section 3)
 MAX_PARAMETERS, MAX_TRAINABLE = 130e6, 40e6
@@ -119,6 +120,20 @@ def parse_args():
                    help='YOLO only: train its pose model with one keypoint per box, the box centre (Ultralytics\' pose '
                         'loss, a distance loss, on top of the detection loss; loss_yolo_kpt); predict.py '
                         '--keypoint-centres then moves each box onto its predicted centre; see sarbench/yolo.py')
+    p.add_argument('--small-box-assign', type=float, default=0.0,
+                   help='YOLO only: YOLO26\'s small-target-aware assignment, box sides below this many input pixels '
+                        'widened around their centre for the assigner\'s candidate test only, so boxes between the '
+                        'grid points get trained (YOLO26: 16; default: 0 = off); see sarbench/yolo.py')
+    p.add_argument('--cls-pool', choices=CLS_POOLS, default='sppf',
+                   help='YOLO only: what the image-class head averages: the SPPF map (end of the backbone) or the '
+                        'neck maps Detect reads, P3-P5, joined (default: sppf)')
+    p.add_argument('--cls-head', choices=CLS_HEADS, default='linear',
+                   help=f'YOLO only: LayerNorm -> Linear, or an MLP with one hidden layer of {CLS_HIDDEN} (GELU) '
+                        '(default: linear)')
+    p.add_argument('--cls-dropout', type=float, default=0.0,
+                   help='YOLO only: dropout before the image-class head\'s last Linear (default: 0 = none)')
+    p.add_argument('--label-smoothing', type=float, default=0.0,
+                   help='label smoothing of the image-class cross-entropy (default: 0)')
     p.add_argument('--unfreeze-lr', type=float, default=2e-5,
                    help='for the pretrained weights of --unfreeze-blocks (default: 2e-5, as for full fine-tuning)')
     p.add_argument('--rot90', action='store_true', help='augment with random 90-degree rotations (training only)')
@@ -151,6 +166,15 @@ def parse_args():
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--backbone-lr', type=float, help='for the trainable backbone parameters (default: --lr)')
     p.add_argument('--weight-decay', type=float, default=0.05)
+    p.add_argument('--optimizer', choices=['adamw', 'sgd'], default='adamw',
+                   help='adamw (weight decay on every parameter), or SGD with Nesterov momentum and, as Ultralytics, '
+                        'no weight decay on 1-D parameters (norm weights, biases); YOLO\'s SGD lr: 0.01 (default: '
+                        'adamw)')
+    p.add_argument('--momentum', type=float, default=0.937, help='SGD momentum (default: 0.937, Ultralytics\')')
+    p.add_argument('--ema', type=float, default=0.0,
+                   help='weight EMA decay, e.g. 0.9999 (Ultralytics\' ModelEMA: the decay ramps up over the first '
+                        'few thousand optimizer steps); validation, test and model.pt then use the EMA weights '
+                        '(default: 0 = off)')
     p.add_argument('--eval-every', type=int, default=4, help='validate every N epochs, and after the last one')
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--limit', type=int, help='use only the first N images of every split (quick checks)')
@@ -199,6 +223,11 @@ def parse_args():
         p.error('--freeze-layers is for the YOLO backbones')
     if not set(args.loss_weights) <= set(MAIN_LOSSES):
         p.error(f'--loss-weights takes names from {MAIN_LOSSES} (the auxiliary losses have their own flags)')
+    yolo_head = args.small_box_assign or args.cls_pool != 'sppf' or args.cls_head != 'linear' or args.cls_dropout
+    if yolo_head and args.backbone not in YOLO_MODELS:
+        p.error('--small-box-assign, --cls-pool, --cls-head and --cls-dropout are for the YOLO backbones')
+    if not 0 <= args.ema < 1 or not 0 <= args.cls_dropout < 1 or not 0 <= args.label_smoothing < 1:
+        p.error('--ema, --cls-dropout and --label-smoothing take 0 to less than 1')
     return args
 
 
@@ -230,24 +259,63 @@ def lr_factor(step, warmup, total, milestones=None):
     return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))  # --epochs 1: no decay phase
 
 
-def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights, accum_steps=1):
-    """One pass over the training set; the loss is cross-entropy plus the detector's losses, plus the
-    auxiliary losses the model returns ('heatmap', 'foreground'), each times weights[name]. The log shows each loss
-    before weighting. One optimizer step per accum_steps batches, on the mean of their losses (the last step of
-    an epoch may have fewer)."""
+def make_optimizer(groups, args):
+    """AdamW over the parameter groups, weight decay on every parameter; or SGD with Nesterov momentum, each group's
+    1-D parameters (norm weights, biases) moved to a group of their own at the same lr without weight decay, as
+    Ultralytics does."""
+    if args.optimizer == 'adamw':
+        return torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
+    no_decay = []
+    for group in groups:
+        flat = [p for p in group['params'] if p.ndim <= 1]
+        group['params'] = [p for p in group['params'] if p.ndim > 1]
+        if flat:
+            no_decay.append({**group, 'params': flat, 'weight_decay': 0.0})
+    # appended after, so group 1 stays the new modules' (the lr in the log)
+    return torch.optim.SGD(groups + no_decay, lr=args.lr, momentum=args.momentum, nesterov=True,
+                           weight_decay=args.weight_decay)
+
+
+class EMA:
+    """Ultralytics' ModelEMA: a copy of the model whose floating-point weights and buffers (BatchNorm statistics
+    included) follow the trained ones, ema = d x ema + (1 - d) x model after every optimizer step, with
+    d = decay x (1 - exp(-updates / tau)): small at first, so the copy does not stay near the starting weights."""
+
+    def __init__(self, model, decay, tau=2000):
+        self.model = copy.deepcopy(model).eval().requires_grad_(False)
+        self.decay, self.tau, self.updates = decay, tau, 0
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        d = self.decay * (1 - math.exp(-self.updates / self.tau))
+        for ema, trained in zip(self.model.state_dict().values(), model.state_dict().values()):
+            if ema.dtype.is_floating_point:  # not BatchNorm's num_batches_tracked
+                ema.mul_(d).add_(trained, alpha=1 - d)
+
+
+def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, weights, accum_steps=1, label_smoothing=0.0,
+                    ema=None):
+    """One pass over the training set; the loss is cross-entropy (label_smoothing) plus the detector's losses, plus
+    the auxiliary losses the model returns ('heatmap', 'foreground'), each times weights[name]. The log shows each
+    loss before weighting. One optimizer step per accum_steps batches, on the mean of their losses (the last step of
+    an epoch may have fewer), each followed by an EMA update if ema is given."""
     model.train()
     start, seen = time.time(), 0
     for step, (images, labels, targets) in enumerate(loader, 1):
         targets = [{'boxes': t['boxes'].cuda(), 'labels': t['labels'].cuda()} for t in targets]
         with torch.autocast('cuda', dtype=torch.bfloat16):  # bf16 has fp32's range: no loss scaling needed
             logits, _, det_losses = model(images.cuda(), targets)
-            losses = {'classification': F.cross_entropy(logits, labels.cuda()), **det_losses}
+            losses = {'classification': F.cross_entropy(logits, labels.cuda(), label_smoothing=label_smoothing),
+                      **det_losses}
         loss = sum(weights.get(name, 1.0) * value for name, value in losses.items())
         (loss / accum_steps).backward()
         if step % accum_steps == 0 or step == len(loader):
             optimizer.step()
             optimizer.zero_grad()
             schedule.step()
+            if ema is not None:
+                ema.update(model)
         seen += len(images)
         if step % 50 == 0 or step == len(loader):
             parts = ' '.join(f'{name} {value.item():.3f}' for name, value in losses.items())
@@ -329,7 +397,9 @@ def main():
         model = YOLOMultiTaskModel(args.backbone, pretrained=args.init == 'pretrained',
                                    in_chans=len(args.input_channels.split(',')),
                                    freeze_layers=args.freeze_layers, quad_fpn=args.quad_fpn,
-                                   centre_keypoint=args.centre_keypoint).cuda()
+                                   centre_keypoint=args.centre_keypoint, small_box_assign=args.small_box_assign,
+                                   cls_pool=args.cls_pool, cls_head=args.cls_head,
+                                   cls_dropout=args.cls_dropout).cuda()
         log(f'{args.backbone}: {model.transferred} tensors from the COCO weights', log_file)
     else:
         backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained',
@@ -375,7 +445,7 @@ def main():
     groups = [{'params': backbone_params, 'lr': args.backbone_lr}, {'params': head_params}]
     if unfrozen:
         groups.append({'params': unfrozen, 'lr': args.unfreeze_lr})
-    optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = make_optimizer(groups, args)
     steps_per_epoch = math.ceil(len(train_loader) / args.accum_steps)  # optimizer steps
     warmup, total = steps_per_epoch, args.epochs * steps_per_epoch  # one epoch of warmup
     # step: the paper's epochs 27 and 33 of 36 (mmdet lr_config step=[27, 33]), as shares of --epochs
@@ -383,21 +453,27 @@ def main():
                   args.epochs * 11 // 12 * steps_per_epoch] if args.schedule == 'step' else None
     schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, warmup, total, milestones))
 
+    # With --ema, the EMA copy is what is validated, tested and saved
+    ema = EMA(model, args.ema) if args.ema else None
+    final_model = ema.model if ema else model
+    if ema:
+        log(f'EMA: decay {args.ema}, tau {ema.tau} steps; validation, test and model.pt use the EMA weights', log_file)
+
     # Train, validating every --eval-every epochs; the reported model is the last-epoch model
     history, start = [], time.time()
     for epoch in range(1, args.epochs + 1):
         train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file,
                         {'heatmap': args.heatmap_weight, 'foreground': args.fgfm_loss_weight, **args.loss_weights},
-                        args.accum_steps)
+                        args.accum_steps, args.label_smoothing, ema)
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            val, val_detections = evaluate(model, val_loader, args.data / 'detection' / 'instances_val.json',
+            val, val_detections = evaluate(final_model, val_loader, args.data / 'detection' / 'instances_val.json',
                                            args.image_size)
             history.append({'epoch': epoch, **val})
             log(f'epoch {epoch} val: {headline(val)}', log_file)
     train_hours = (time.time() - start) / 3600
 
     # Evaluate on test, once
-    test, test_detections = evaluate(model, test_loader, args.data / 'detection' / 'instances_test.json',
+    test, test_detections = evaluate(final_model, test_loader, args.data / 'detection' / 'instances_test.json',
                                      args.image_size)
     peak_gb = torch.cuda.max_memory_allocated() / 2**30
     log(f'test: {headline(test)}\ntraining {train_hours:.2f} h, peak GPU memory {peak_gb:.1f} GB', log_file)
@@ -411,7 +487,7 @@ def main():
     (run_dir / 'metrics.json').write_text(json.dumps(summary, indent=2, default=str))
     (run_dir / 'predictions_val.json').write_text(json.dumps(val_detections))
     (run_dir / 'predictions_test.json').write_text(json.dumps(test_detections))
-    torch.save(model.state_dict(), run_dir / 'model.pt')
+    torch.save(final_model.state_dict(), run_dir / 'model.pt')
     append_results(summary, args.out / 'results.csv')
 
 

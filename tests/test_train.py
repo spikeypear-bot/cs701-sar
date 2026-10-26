@@ -30,12 +30,25 @@ def test_ema_follows_the_weights_and_batchnorm_statistics_with_a_ramped_decay():
 def test_sgd_drops_weight_decay_on_1d_parameters_and_keeps_the_head_group_second():
     backbone, head = nn.Linear(4, 4), nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 2))
     groups = [{'params': list(backbone.parameters()), 'lr': 0.02}, {'params': list(head.parameters())}]
-    optimizer = make_optimizer(groups, SimpleNamespace(optimizer='sgd', lr=0.01, momentum=0.937, weight_decay=5e-4))
+    optimizer = make_optimizer(groups, SimpleNamespace(optimizer='sgd', lr=0.01, momentum=0.937, weight_decay=5e-4,
+                                                       no_decay_1d=False))
     g = optimizer.param_groups
     assert isinstance(optimizer, torch.optim.SGD) and [len(group['params']) for group in g] == [1, 1, 1, 3]
     assert g[1]['params'][0] is head[1].weight and g[1]['lr'] == 0.01 and g[1]['weight_decay'] == 5e-4
     assert g[2]['lr'] == 0.02 and g[2]['weight_decay'] == 0 and g[3]['weight_decay'] == 0
     assert g[0]['nesterov'] and g[0]['momentum'] == 0.937
     adamw = make_optimizer([{'params': list(backbone.parameters())}],
-                           SimpleNamespace(optimizer='adamw', lr=1e-3, weight_decay=5e-4))
+                           SimpleNamespace(optimizer='adamw', lr=1e-3, weight_decay=5e-4, no_decay_1d=False))
     assert isinstance(adamw, torch.optim.AdamW) and adamw.param_groups[0]['weight_decay'] == 5e-4
+    assert len(adamw.param_groups) == 1 and len(adamw.param_groups[0]['params']) == 2
+
+
+def test_adamw_no_decay_1d_moves_norm_weights_and_biases_to_a_group_without_decay():
+    backbone, head = nn.Linear(4, 4), nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 2))
+    groups = [{'params': list(backbone.parameters()), 'lr': 0.02}, {'params': list(head.parameters())}]
+    optimizer = make_optimizer(groups, SimpleNamespace(optimizer='adamw', lr=1e-3, weight_decay=0.05,
+                                                       no_decay_1d=True))
+    g = optimizer.param_groups
+    assert isinstance(optimizer, torch.optim.AdamW) and [len(group['params']) for group in g] == [1, 1, 1, 3]
+    assert g[1]['params'][0] is head[1].weight and g[1]['lr'] == 1e-3 and g[1]['weight_decay'] == 0.05
+    assert g[2]['lr'] == 0.02 and g[2]['weight_decay'] == 0 and g[3]['weight_decay'] == 0

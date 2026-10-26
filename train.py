@@ -170,10 +170,12 @@ def parse_args():
     p.add_argument('--backbone-lr', type=float, help='for the trainable backbone parameters (default: --lr)')
     p.add_argument('--weight-decay', type=float, default=0.05)
     p.add_argument('--optimizer', choices=['adamw', 'sgd'], default='adamw',
-                   help='adamw (weight decay on every parameter), or SGD with Nesterov momentum and, as Ultralytics, '
-                        'no weight decay on 1-D parameters (norm weights, biases); YOLO\'s SGD lr: 0.01 (default: '
-                        'adamw)')
+                   help='adamw (weight decay on every parameter, unless --no-decay-1d), or SGD with Nesterov momentum '
+                        'and, as Ultralytics, no weight decay on 1-D parameters (norm weights, biases); YOLO\'s SGD '
+                        'lr: 0.01 (default: adamw)')
     p.add_argument('--momentum', type=float, default=0.937, help='SGD momentum (default: 0.937, Ultralytics\')')
+    p.add_argument('--no-decay-1d', action='store_true',
+                   help='AdamW: no weight decay on 1-D parameters (norm weights, biases), as SGD always does')
     p.add_argument('--ema', type=float, default=0.0,
                    help='weight EMA decay, e.g. 0.9999 (Ultralytics\' ModelEMA: the decay ramps up over the first '
                         'few thousand optimizer steps); validation, test and model.pt then use the EMA weights '
@@ -264,18 +266,19 @@ def lr_factor(step, warmup, total, milestones=None):
 
 
 def make_optimizer(groups, args):
-    """AdamW over the parameter groups, weight decay on every parameter; or SGD with Nesterov momentum, each group's
-    1-D parameters (norm weights, biases) moved to a group of their own at the same lr without weight decay, as
-    Ultralytics does."""
-    if args.optimizer == 'adamw':
-        return torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
+    """AdamW over the parameter groups, weight decay on every parameter; or SGD with Nesterov momentum. With SGD, or
+    AdamW and args.no_decay_1d, each group's 1-D parameters (norm weights, biases) move to a group of their own at
+    the same lr without weight decay, as Ultralytics does."""
     no_decay = []
-    for group in groups:
-        flat = [p for p in group['params'] if p.ndim <= 1]
-        group['params'] = [p for p in group['params'] if p.ndim > 1]
-        if flat:
-            no_decay.append({**group, 'params': flat, 'weight_decay': 0.0})
+    if args.optimizer == 'sgd' or args.no_decay_1d:
+        for group in groups:
+            flat = [p for p in group['params'] if p.ndim <= 1]
+            group['params'] = [p for p in group['params'] if p.ndim > 1]
+            if flat:
+                no_decay.append({**group, 'params': flat, 'weight_decay': 0.0})
     # appended after, so group 1 stays the new modules' (the lr in the log)
+    if args.optimizer == 'adamw':
+        return torch.optim.AdamW(groups + no_decay, lr=args.lr, weight_decay=args.weight_decay)
     return torch.optim.SGD(groups + no_decay, lr=args.lr, momentum=args.momentum, nesterov=True,
                            weight_decay=args.weight_decay)
 

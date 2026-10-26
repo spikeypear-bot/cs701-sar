@@ -71,4 +71,8 @@ sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 -
 sbatch --time=08:00:00 train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 200 --rot90 --boxpaste-prob 0.5 --name yolov8m-aug-e200
 # yolov8m-aug-e200 + brightness/contrast jitter (each uniform in 1 +- 0.2); vs yolov8m-aug-e200
 sbatch --time=08:00:00 train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 200 --rot90 --boxpaste-prob 0.5 --brightness 0.2 --name yolov8m-aug-bright-e200
+# YOLOv8m e100, AdamW weight decay 0.01 on weights only (--no-decay-1d: no decay on norm weights and biases); yolov8m-e100 recipe otherwise (wd 5e-4 on every parameter, 44.80 mAP), vs yolov8m-e100
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 0.01 --no-decay-1d --epochs 100 --name yolov8m-wd0.01-e100
+# YOLOv8m e100, AdamW weight decay 0.05 on weights only (--no-decay-1d); vs yolov8m-e100 and yolov8m-wd0.01-e100
+sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 0.05 --no-decay-1d --epochs 100 --name yolov8m-wd0.05-e100
 ```

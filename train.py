@@ -144,6 +144,9 @@ def parse_args():
                         'random_crop')
     p.add_argument('--crop-min-side', type=float, default=0.5,
                    help='smallest crop side, as a share of the image side: zooms up to 1 / this (default: 0.5)')
+    p.add_argument('--brightness', type=float, default=0.0,
+                   help='brightness and contrast jitter of training images, each uniform in 1 +- this, e.g. 0.2 '
+                        '(default: 0 = off); see sarbench/data.py jitter_intensity')
     p.add_argument('--boxpaste-prob', type=float, default=0.0,
                    help='chance that a training image gets same-class BoxPaste objects (default: 0 = off)')
     p.add_argument('--boxpaste-max', type=int, default=3, help='at most this many pasted objects per image')
@@ -226,8 +229,8 @@ def parse_args():
     yolo_head = args.small_box_assign or args.cls_pool != 'sppf' or args.cls_head != 'linear' or args.cls_dropout
     if yolo_head and args.backbone not in YOLO_MODELS:
         p.error('--small-box-assign, --cls-pool, --cls-head and --cls-dropout are for the YOLO backbones')
-    if not 0 <= args.ema < 1 or not 0 <= args.cls_dropout < 1 or not 0 <= args.label_smoothing < 1:
-        p.error('--ema, --cls-dropout and --label-smoothing take 0 to less than 1')
+    if not all(0 <= v < 1 for v in (args.ema, args.cls_dropout, args.label_smoothing, args.brightness)):
+        p.error('--ema, --cls-dropout, --label-smoothing and --brightness take 0 to less than 1')
     return args
 
 
@@ -244,7 +247,8 @@ def make_loader(args, split):
                 'classes': args.boxpaste_classes.split(',')} if args.boxpaste_prob > 0 else None
     dataset = SARMultiTask(args.data, split, train=train, size=args.image_size, limit=args.limit,
                            channels=args.input_channels.split(','), stats=args.channel_stats, boxpaste=boxpaste,
-                           rot90=args.rot90, crop_prob=args.crop_prob, crop_min_side=args.crop_min_side)
+                           rot90=args.rot90, crop_prob=args.crop_prob, crop_min_side=args.crop_min_side,
+                           brightness=args.brightness)
     return DataLoader(dataset, args.batch_size, shuffle=train, num_workers=args.workers, collate_fn=collate,
                       persistent_workers=train and args.workers > 0)  # training workers live across epochs
 

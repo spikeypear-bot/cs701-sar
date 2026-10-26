@@ -10,8 +10,8 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import tv_tensors
 
-from sarbench.data import (MEAN, STD, BoxPaste, SARMultiTask, collate, input_channels, random_crop, rot90,
-                           to_original_xywh)
+from sarbench.data import (MEAN, STD, BoxPaste, SARMultiTask, collate, input_channels, jitter_intensity,
+                           random_crop, rot90, to_original_xywh)
 from sarbench.metrics import detection_metrics
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
@@ -112,6 +112,20 @@ def test_boxpaste_adds_free_boxes_over_the_pasted_objects(tmp_path):
             for x2, y2, w2, h2 in boxes[:i]:  # no overlap with earlier boxes
                 assert x + w <= x2 or x2 + w2 <= x or y + h <= y2 or y2 + h2 <= y
     assert paste(gray, [[0., 0., 10., 10.]], category=4)[1] == [[0., 0., 10., 10.]]  # no donors of class 4
+
+
+def test_jitter_intensity_scales_contrast_and_brightness_within_its_range():
+    gray = np.tile(np.arange(0, 200, 2, dtype=np.uint8), (8, 1))  # a ramp 0..198, mean 99
+    for seed in range(20):
+        torch.manual_seed(seed)
+        out = jitter_intensity(gray, 0.2)
+        torch.manual_seed(seed)
+        c, b = (1 + 0.2 * (2 * torch.rand(2) - 1)).tolist()
+        assert 0.8 <= c <= 1.2 and 0.8 <= b <= 1.2 and out.dtype == np.uint8 and out.shape == gray.shape
+        expected = (((gray.astype(np.float32) - 99) * c + 99) * b).round().clip(0, 255)
+        assert np.array_equal(out, expected.astype(np.uint8))
+    assert np.array_equal(jitter_intensity(gray, 0.0), gray)
+    assert SARMultiTask(ROOT, 'val', limit=2, brightness=0.2).brightness == 0.0  # not training: no jitter
 
 
 def test_input_channels_keep_raw_and_mark_bright_points():

@@ -1,7 +1,7 @@
 """The course data in TA Zichen's folder layout (see README): every image has one class label and >= 1 box.
 Loads images and boxes at a fixed input size and maps predicted boxes back to original pixels. Options: input
-channels from SAR filters (input_channels), and three training augmentations, BoxPaste, 90-degree rotations and
-random zoom-in crops."""
+channels from SAR filters (input_channels), and four training augmentations, BoxPaste, brightness/contrast jitter,
+90-degree rotations and random zoom-in crops."""
 import csv
 import json
 import random
@@ -150,6 +150,16 @@ class BoxPaste:
         return gray.clip(0, 255).astype(np.uint8), boxes
 
 
+def jitter_intensity(gray, strength):
+    """Brightness and contrast jitter of a uint8 image [H, W]: contrast c and brightness b each uniform in
+    1 +- strength, (gray - mean) x c + mean, then x b, rounded and clipped to 0..255. Display scaling of SAR varies
+    between sensors and images; objects keep their size and place, so the boxes are unchanged."""
+    c, b = (1 + strength * (2 * torch.rand(2) - 1)).tolist()
+    g = gray.astype(np.float32)
+    mean = g.mean()
+    return (((g - mean) * c + mean) * b).round().clip(0, 255).astype(np.uint8)
+
+
 def rot90(image, boxes, k):
     """Rotate a square image [C, S, S] and its XYXY boxes by k x 90 degrees; boxes stay exact at right angles."""
     size = image.shape[-1]
@@ -188,11 +198,12 @@ class SARMultiTask(Dataset):
     """The images of classification/{split}.csv with their boxes from detection/instances_{split}.json.
     An item is (image [C, size, size], label 0..8, target), target = {'boxes': XYXY on the resized
     image, 'labels': 1..9, 'image_id': COCO id, 'orig_size': (h, w)}. C = len(channels), see input_channels.
-    Training only: boxpaste = BoxPaste options {prob, max_pastes, max_size, classes (names)}, rot90, and random_crop
-    with probability crop_prob (crop sides crop_min_side..1 of the image)."""
+    Training only: boxpaste = BoxPaste options {prob, max_pastes, max_size, classes (names)}, jitter_intensity of
+    strength brightness (after BoxPaste, before the filter channels), rot90, and random_crop with probability
+    crop_prob (crop sides crop_min_side..1 of the image)."""
 
     def __init__(self, root, split, train=False, size=512, limit=None, channels=('raw',), stats=None,
-                 boxpaste=None, rot90=False, crop_prob=0.0, crop_min_side=0.5):
+                 boxpaste=None, rot90=False, crop_prob=0.0, crop_min_side=0.5, brightness=0.0):
         self.root = Path(root)
         with open(self.root / 'classification' / f'{split}.csv') as f:
             self.rows = list(csv.DictReader(f))[:limit]
@@ -214,6 +225,7 @@ class SARMultiTask(Dataset):
                           for ann in self.annotations[info['id']] if ann['category_id'] in classes]
             self.boxpaste = BoxPaste(items, boxpaste['prob'], boxpaste['max_pastes'], boxpaste['max_size'])
         self.rot90 = train and rot90
+        self.brightness = brightness if train else 0.0
         self.crop_prob, self.crop_min_side = (crop_prob if train else 0.0), crop_min_side
         flips = [v2.RandomHorizontalFlip(), v2.RandomVerticalFlip()] if train else []
         self.transform = v2.Compose([
@@ -238,6 +250,8 @@ class SARMultiTask(Dataset):
         if self.boxpaste:  # before the filters, so pasted objects are filtered like the rest of the image
             gray, xywh = self.boxpaste(gray, xywh, labels[0])
             labels += [labels[0]] * (len(xywh) - len(labels))
+        if self.brightness:  # after BoxPaste, so pasted objects are jittered with their new surroundings
+            gray = jitter_intensity(gray, self.brightness)
         boxes = tv_tensors.BoundingBoxes(xywh, format='XYWH', canvas_size=orig_size,
                                          dtype=torch.float32)  # integer boxes would be truncated by Resize
         image, boxes = self.transform(input_channels(gray, self.channels), boxes)

@@ -67,4 +67,8 @@ sbatch --time=08:00:00 train.slurm --backbone yolov8m --init pretrained --adapt 
 sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --loss-weights loss_yolo_box=1.5 --name yolov8m-box1.5-e48
 # YOLOv8m DFL gain x2 (1.5 -> 3); vs yolov8m-e48
 sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 48 --loss-weights loss_yolo_dfl=2 --name yolov8m-dfl2-e48
+# YOLOv8m 200 epochs + rot90 + same-class BoxPaste (P 0.5, 1-3 objects <= 32 px of ship/turbine/oil tank/car/aircraft); size-preserving augmentation first tested on YOLO and on a long run; vs yolov8m-e200
+sbatch --time=08:00:00 train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 200 --rot90 --boxpaste-prob 0.5 --name yolov8m-aug-e200
+# yolov8m-aug-e200 + brightness/contrast jitter (each uniform in 1 +- 0.2); vs yolov8m-aug-e200
+sbatch --time=08:00:00 train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 --weight-decay 5e-4 --epochs 200 --rot90 --boxpaste-prob 0.5 --brightness 0.2 --name yolov8m-aug-bright-e200
 ```

@@ -7,6 +7,7 @@ this script; setup in docs/claude.md). Examples:
   sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 \\
       --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --name y26x-p2-f5-8-e100
   python yolo26.py --predict runs/<run> cs701-sar-course-data/val/images.json   # -> <run>/submission_val.zip
+  python yolo26.py --score runs/<run> --head one2one   # holdout scores with the other head, nothing written
 Writes runs/<name>_<time>/: Ultralytics' folder (ultralytics/, weights/last.pt saved every epoch), args.json,
 predictions_test.json and metrics.json (the holdout, scored as train.py scores it), and a row in runs/results.csv.
 --stop-hours (set by train.slurm from the job's time limit): after an epoch, exit with code 75 if the next one and the
@@ -60,6 +61,12 @@ def parse_args():
     p.add_argument('--albu-p', type=float, default=0.5, help='probability of each Albumentations transform (default: 0.5)')
     p.add_argument('--hyp', type=parse_hyp, default={},
                    help='more Ultralytics training arguments, e.g. mosaic=0,scale=0.2,flipud=0.5,optimizer=AdamW')
+    p.add_argument('--o2m-final', type=float,
+                   help='ProgLoss: final weight of the one-to-many loss, the only loss reaching the backbone and neck '
+                        '(Ultralytics: 0.8 decaying to 0.1; 0.8 = no decay; default: Ultralytics\')')
+    p.add_argument('--stal-min', type=float,
+                   help='STAL: ground-truth sides below this (input px) are enlarged to it when picking candidate '
+                        'anchors (Ultralytics: the second stride, 8 px with P2; default: Ultralytics\')')
     p.add_argument('--name', help='run name; the run folder is <out>/<name>_<time> (needed for training)')
     p.add_argument('--out', type=Path, default=Path('runs'))
     p.add_argument('--stop-hours', type=float, help='see the description; train.slurm sets it')
@@ -69,8 +76,12 @@ def parse_args():
     p.add_argument('--root', type=Path, help='--predict: the folder the file names in images.json are relative to '
                                              '(default: the folder of images.json)')
     p.add_argument('--zip', type=Path, help='--predict: the zip (default: <run>/submission_<folder of images.json>.zip)')
+    p.add_argument('--score', type=Path, metavar='RUN', help='score a finished run on the holdout (no training)')
+    p.add_argument('--head', choices=['one2many', 'one2one'], default='one2many',
+                   help='--predict / --score: YOLO26\'s one-to-many head + NMS (Ultralytics\' default, used for every '
+                        'run so far) or its NMS-free one-to-one head')
     args = p.parse_args()
-    if not (args.predict or args.resume or args.name):
+    if not (args.predict or args.score or args.resume or args.name):
         p.error('training needs --name')
     return args
 
@@ -88,6 +99,25 @@ def albumentations(args):
         transforms.append(A.RandomBrightnessContrast(brightness_limit=args.brightness_contrast,
                                                      contrast_limit=args.brightness_contrast, p=args.albu_p))
     return transforms or None
+
+
+def patch_losses(o2m_final=None, stal_min=None):
+    """--o2m-final, --stal-min: YOLO26 loss constants Ultralytics hard-codes (utils/loss.py E2ELoss, utils/tal.py
+    TaskAlignedAssigner), set after their own __init__. None keeps Ultralytics' value."""
+    from ultralytics.utils import loss, tal
+
+    def after_init(cls, name, value):
+        init = cls.__init__
+
+        def patched(self, *a, **k):
+            init(self, *a, **k)
+            setattr(self, name, value)
+        cls.__init__ = patched
+
+    if o2m_final is not None:
+        after_init(loss.E2ELoss, 'final_o2m', o2m_final)
+    if stal_min is not None:
+        after_init(tal.TaskAlignedAssigner, 'stride_val', stal_min)
 
 
 def callbacks(model, run_dir, args, process_start, counts):
@@ -128,17 +158,19 @@ def earlier_seconds(run_dir):
     return float(path.read_text()) if path.exists() else 0.0
 
 
-def predict(weights, images, root, size, batch):
+def predict(weights, images, root, size, batch, head='one2many'):
     """Each image's boxes ([x1, y1, x2, y2] on the size x size input, as write_submission takes them), classes 0..8
     and scores, at confidence >= 0.001, at most 100 per image; the image's class is its highest-scored box's
-    (class 0 if it has none)."""
+    (class 0 if it has none). head: one2many = NMS on the one-to-many head; one2one = the NMS-free head
+    (Ultralytics' nms=False)."""
     from ultralytics import YOLO
     model = YOLO(str(weights))
     preds = {}
     for start in range(0, len(images), batch):
         chunk = images[start:start + batch]
         for im, r in zip(chunk, model.predict([str(root / im['file_name']) for im in chunk], imgsz=size, conf=0.001,
-                                              iou=0.7, max_det=100, batch=batch, verbose=False)):
+                                              iou=0.7, max_det=100, batch=batch, verbose=False,
+                                              nms=False if head == 'one2one' else None)):
             scale = [size / im['width'], size / im['height']] * 2  # original pixels -> input pixels
             boxes = [[v * f for v, f in zip(box, scale)] for box in r.boxes.xyxy.tolist()]
             classes, scores = r.boxes.cls.int().tolist(), r.boxes.conf.tolist()
@@ -147,11 +179,11 @@ def predict(weights, images, root, size, batch):
     return preds
 
 
-def score_holdout(weights, root, size, batch):
+def score_holdout(weights, root, size, batch, head='one2many'):
     """The holdout's classification and detection scores (train.py's metrics) and its detections."""
     gt_json = root / 'detection' / 'instances_test.json'
     gt = json.loads(gt_json.read_text())
-    preds = predict(weights, gt['images'], root, size, batch)
+    preds = predict(weights, gt['images'], root, size, batch, head)
     truth = {a['image_id']: a['category_id'] - 1 for a in gt['annotations']}
     detections = []
     for im in gt['images']:
@@ -175,9 +207,17 @@ def main():
         images = json.loads(images_json.read_text())['images']
         zip_path = args.zip or run / f'submission_{images_json.parent.name}.zip'
         write_submission(images, predict(run / 'ultralytics' / 'weights' / 'last.pt', images,
-                                         args.root or images_json.parent, options['imgsz'], options['batch']),
+                                         args.root or images_json.parent, options['imgsz'], options['batch'],
+                                         args.head),
                          size=options['imgsz'], out=zip_path)
         print(f'{len(images)} images -> {zip_path}')
+        return
+    if args.score:
+        options = json.loads((args.score / 'args.json').read_text())
+        test, _ = score_holdout(args.score / 'ultralytics' / 'weights' / 'last.pt', Path(options['data']),
+                                options['imgsz'], options['batch'], args.head)
+        print(f'{args.score.name} --head {args.head}: macro_f1 {test["macro_f1"]:.4f} mAP {test["mAP"]:.4f} '
+              f'AP50 {test["AP50"]:.4f}')
         return
 
     from ultralytics import YOLO
@@ -198,6 +238,7 @@ def main():
         model = YOLO(f'{args.model}.yaml').load(f'{plain}.pt') if args.model.endswith('-p2') else YOLO(f'{plain}.pt')
     counts = {}
     callbacks(model, run_dir, args, process_start, counts)
+    patch_losses(getattr(args, 'o2m_final', None), getattr(args, 'stal_min', None))  # runs before these flags: None
     data_yaml = write_yolo_dataset(args.data)
     counts['train_start'] = time.time()
     common = dict(augmentations=albumentations(args), workers=args.workers)  # also taken on resume

@@ -78,3 +78,11 @@ sbatch train.slurm --backbone yolov8m --init pretrained --adapt full --lr 1e-3 -
 # YOLO26x-P2 (Ultralytics 8.4.189 trainer and default recipe, env cs701y26), COCO yolo26x weights where shapes fit, layers 5-8 frozen (40 M limit), Albumentations multiplicative noise 1 +- 0.1, gamma 80-120, brightness/contrast 0.2 (p 0.5 each), 100 ep; image class = top box's class; as the groupmate's run (Codabench dm +41.16), vs yolov8m-e100
 sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --name y26x-p2-f5-8-e100
 ```
+# y26x-p2 e100 screen G: Ultralytics scale 0.5 -> 0.25 (less shrinking of tiny objects; oil tank -7.9), vs y26x-p2-f5-8-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp scale=0.25 --name y26x-p2-f5-8-scale025-e100
+# y26x-p2 e100 screen L: box loss weight 7.5 -> 12 (loose boxes: AP@0.5 70.5 vs AP 45.5), vs y26x-p2-f5-8-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp box=12 --name y26x-p2-f5-8-box12-e100
+# y26x-p2 e100 screen F: vertical flips on (Ultralytics flipud 0 -> 0.5; our own trainer always used both flips), vs y26x-p2-f5-8-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp flipud=0.5 --name y26x-p2-f5-8-flipud-e100
+# y26x-p2 e100 screen P: ProgLoss one-to-many weight kept at 0.8 (Ultralytics decays it to 0.1; only loss reaching backbone + neck), vs y26x-p2-f5-8-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --o2m-final 0.8 --name y26x-p2-f5-8-o2m08-e100

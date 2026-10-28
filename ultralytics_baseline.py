@@ -40,10 +40,14 @@ def parse_args():
     return p.parse_args()
 
 
-def write_yolo_dataset(root):
+IGNORE_CLASS = 9  # one past the 9 course classes: a train box that gives no loss (yolo26.py --ignore-dim)
+
+
+def write_yolo_dataset(root, ignore=frozenset()):
     """Ultralytics' format: data/labels/<stem>.txt next to data/images/ (one 'class cx cy w h' line per box,
     normalized; boxes clipped to the image, as Ultralytics drops an image with a coordinate outside 0-1), image lists
-    data/yolo/{train,val}.txt (val = the holdout) and data/yolo/data.yaml -> its path."""
+    data/yolo/{train,val}.txt (val = the holdout) and data/yolo/data.yaml -> its path. ignore: ids of train
+    annotations written as IGNORE_CLASS."""
     (root / 'labels').mkdir(exist_ok=True)
     (root / 'yolo').mkdir(exist_ok=True)
     for split in ('train', 'val'):
@@ -59,7 +63,8 @@ def write_yolo_dataset(root):
                 x, y, bw, bh = a['bbox']
                 x1, y1, x2, y2 = max(x, 0), max(y, 0), min(x + bw, w), min(y + bh, h)
                 if x2 > x1 and y2 > y1:
-                    lines.append(f'{a["category_id"] - 1} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} '
+                    cls = IGNORE_CLASS if split == 'train' and a['id'] in ignore else a['category_id'] - 1
+                    lines.append(f'{cls} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} '
                                  f'{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}')
             # not resolve(): Ultralytics finds the labels by the '/images/' in the path, which a symlink could hide
             image = (root / im['file_name']).absolute()  # data/images/00001.jpg -> labels at data/labels/00001.txt
@@ -69,7 +74,9 @@ def write_yolo_dataset(root):
     names = {c['id'] - 1: c['name'] for c in coco['categories']}
     yaml = root / 'yolo' / 'data.yaml'
     yaml.write_text(f'path: {(root / "yolo").absolute()}\ntrain: {(root / "yolo" / "train.txt").absolute()}\n'
-                    f'val: {(root / "yolo" / "val.txt").absolute()}\nnames: {json.dumps(names)}\n')
+                    f'val: {(root / "yolo" / "val.txt").absolute()}\nnames: {json.dumps(names)}\n'
+                    # Ultralytics checks label classes against bg_class_idx when set: lets IGNORE_CLASS through
+                    + (f'bg_class_idx: {IGNORE_CLASS + 1}\n' if ignore else ''))
     return yaml
 
 

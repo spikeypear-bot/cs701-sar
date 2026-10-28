@@ -86,3 +86,13 @@ sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 
 sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp flipud=0.5 --name y26x-p2-f5-8-flipud-e100
 # y26x-p2 e100 screen P: ProgLoss one-to-many weight kept at 0.8 (Ultralytics decays it to 0.1; only loss reaching backbone + neck), vs y26x-p2-f5-8-e100
 sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --o2m-final 0.8 --name y26x-p2-f5-8-o2m08-e100
+# y26x-p2 e100 screen I: bridge/playground train boxes with no bright return (943 + 390, finding 21) give no loss (not targets, not background), vs y26x-p2-f5-8-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --ignore-dim bridge,playground --name y26x-p2-f5-8-ignoredim-e100
+# y26x-p2 e100 augmentation bundle (seed 0): per-class scale + per-pixel speckle + JPEG 50-100, vs y26x-p2-f5-8-scale025-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --elementwise --jpeg 50 --class-scale default=0.25,ship=0.5,car=0.5,oil_tank=0.1,wind_turbine=0.1,harbor=0.1 --name y26x-p2-f5-8-augbundle-e100
+# y26x-p2 e100 augmentation bundle, seed 1
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --elementwise --jpeg 50 --class-scale default=0.25,ship=0.5,car=0.5,oil_tank=0.1,wind_turbine=0.1,harbor=0.1 --seed 1 --name y26x-p2-f5-8-augbundle-s1-e100
+# y26x-p2 e100 scale025 seed 1: seed noise of the baseline (per class), vs y26x-p2-f5-8-scale025-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp scale=0.25 --seed 1 --name y26x-p2-f5-8-scale025-s1-e100
+# y26x-p2 e100 mosaic off (Ultralytics mosaic 1.0 -> 0), vs y26x-p2-f5-8-scale025-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp scale=0.25,mosaic=0 --name y26x-p2-f5-8-scale025-nomosaic-e100

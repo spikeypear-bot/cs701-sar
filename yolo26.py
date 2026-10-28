@@ -24,7 +24,7 @@ import yaml
 from make_submission import write_submission
 from sarbench.metrics import classification_metrics, detection_metrics
 from train import MAX_PARAMETERS, MAX_TRAINABLE, RESUME_EXIT, append_results, parse_blocks, save_code_version
-from ultralytics_baseline import write_yolo_dataset
+from ultralytics_baseline import IGNORE_CLASS, write_yolo_dataset
 
 
 def parse_hyp(spec):
@@ -58,7 +58,14 @@ def parse_args():
                    help='Albumentations RandomGamma, gamma uniform in 1 +- this (e.g. 0.2 = its default 80-120; 0: off)')
     p.add_argument('--brightness-contrast', type=float, default=0.0,
                    help='Albumentations RandomBrightnessContrast, both limits (e.g. 0.2, its default; 0: off)')
+    p.add_argument('--jpeg', type=int, default=0, metavar='Q',
+                   help='Albumentations ImageCompression, JPEG quality uniform in Q-100 (e.g. 50; 0: off): PNGs '
+                        'come from a second source in only four classes (finding 21)')
     p.add_argument('--albu-p', type=float, default=0.5, help='probability of each Albumentations transform (default: 0.5)')
+    p.add_argument('--class-scale', type=parse_hyp, default={}, metavar='CLASS=A,...',
+                   help='scale augmentation per class instead of Ultralytics\' one factor per mosaic: each training '
+                        'image resized by 1 +- A (uniform) before Mosaic, A by its class, default=A for the rest, '
+                        'e.g. default=0.25,ship=0.5,oil_tank=0.1; sets Ultralytics\' scale to 0')
     p.add_argument('--hyp', type=parse_hyp, default={},
                    help='more Ultralytics training arguments, e.g. mosaic=0,scale=0.2,flipud=0.5,optimizer=AdamW')
     p.add_argument('--o2m-final', type=float,
@@ -67,6 +74,10 @@ def parse_args():
     p.add_argument('--stal-min', type=float,
                    help='STAL: ground-truth sides below this (input px) are enlarged to it when picking candidate '
                         'anchors (Ultralytics: the second stride, 8 px with P2; default: Ultralytics\')')
+    p.add_argument('--ignore-dim', type=lambda s: s.split(','), default=[], metavar='CLASSES',
+                   help='train boxes of these classes (e.g. bridge,playground) with no bright return (brightest '
+                        'pixel at most the image\'s 90th percentile; finding 21) give no loss: not a target, and the '
+                        'anchors inside them are not trained as background either (default: none)')
     p.add_argument('--name', help='run name; the run folder is <out>/<name>_<time> (needed for training)')
     p.add_argument('--out', type=Path, default=Path('runs'))
     p.add_argument('--stop-hours', type=float, help='see the description; train.slurm sets it')
@@ -83,6 +94,8 @@ def parse_args():
     args = p.parse_args()
     if not (args.predict or args.score or args.resume or args.name):
         p.error('training needs --name')
+    if args.class_scale and 'scale' in args.hyp:
+        p.error('--class-scale replaces --hyp scale')
     return args
 
 
@@ -98,12 +111,66 @@ def albumentations(args):
     if args.brightness_contrast:
         transforms.append(A.RandomBrightnessContrast(brightness_limit=args.brightness_contrast,
                                                      contrast_limit=args.brightness_contrast, p=args.albu_p))
+    if getattr(args, 'jpeg', 0):  # runs before the flag: no key
+        transforms.append(A.ImageCompression(quality_range=(args.jpeg, 100), p=args.albu_p))
     return transforms or None
 
 
-def patch_losses(o2m_final=None, stal_min=None):
+def patch_class_scale(scales, default):
+    """--class-scale: training images (Ultralytics' augment=True dataset) resized by 1 +- a, a = scales[class index]
+    or default, before Mosaic places them. Ultralytics keeps YOLO labels normalised until Mosaic, which denormalises
+    them by the returned shape, so the boxes follow the image."""
+    import random
+    import cv2
+    from ultralytics.data.base import BaseDataset
+    load = BaseDataset.load_image
+
+    def scaled(self, i, *args, **kwargs):
+        im, hw0, hw = load(self, i, *args, **kwargs)
+        cls = self.labels[i]['cls']
+        # one class per image; min() skips --ignore-dim's IGNORE_CLASS, the highest index
+        a = scales.get(int(cls.min()), default) if len(cls) else default
+        if not self.augment or not a:
+            return im, hw0, hw
+        s = random.uniform(1 - a, 1 + a)
+        im = cv2.resize(im, (max(1, round(hw[1] * s)), max(1, round(hw[0] * s))), interpolation=cv2.INTER_LINEAR)
+        return im, hw0, im.shape[:2]
+    BaseDataset.load_image = scaled
+
+
+def dim_boxes(root, classes):
+    """--ignore-dim: ids of the train boxes of these classes whose brightest pixel is at most their image's 90th
+    percentile (no bright return)."""
+    import numpy as np
+    from PIL import Image
+    coco = json.loads((root / 'detection' / 'instances_train.json').read_text())
+    ids = {c['name']: c['id'] for c in coco['categories']}
+    if unknown := set(classes) - set(ids):
+        sys.exit(f'--ignore-dim: unknown classes {sorted(unknown)}')
+    wanted, boxes = {ids[c] for c in classes}, {}
+    for a in coco['annotations']:
+        if a['category_id'] in wanted:
+            boxes.setdefault(a['image_id'], []).append(a)
+    dim = set()
+    for im in coco['images']:
+        if im['id'] in boxes:
+            pixels = np.asarray(Image.open(root / im['file_name']).convert('L'))
+            p90 = np.percentile(pixels, 90, method='inverted_cdf')
+            for a in boxes[im['id']]:
+                x, y, w, h = a['bbox']
+                if pixels[int(y):int(y + h + 1), int(x):int(x + w + 1)].max() <= p90:
+                    dim.add(a['id'])
+    total = sum(map(len, boxes.values()))
+    print(f'--ignore-dim {",".join(classes)}: {len(dim)} of {total} train boxes ignored', flush=True)
+    return dim
+
+
+def patch_losses(o2m_final=None, stal_min=None, ignore_cls=None):
     """--o2m-final, --stal-min: YOLO26 loss constants Ultralytics hard-codes (utils/loss.py E2ELoss, utils/tal.py
-    TaskAlignedAssigner), set after their own __init__. None keeps Ultralytics' value."""
+    TaskAlignedAssigner), set after their own __init__. None keeps Ultralytics' value. ignore_cls (--ignore-dim):
+    boxes of this label class are dropped from the targets, and anchors whose centre lies inside one (sides enlarged
+    to STAL's floor, as the assigner does) get no classification loss unless another box assigns them."""
+    import torch
     from ultralytics.utils import loss, tal
 
     def after_init(cls, name, value):
@@ -118,6 +185,30 @@ def patch_losses(o2m_final=None, stal_min=None):
         after_init(loss.E2ELoss, 'final_o2m', o2m_final)
     if stal_min is not None:
         after_init(tal.TaskAlignedAssigner, 'stride_val', stal_min)
+    if ignore_cls is not None:
+        assigned = loss.v8DetectionLoss.get_assigned_targets_and_loss
+
+        def without_ignored(self, preds, batch, **kwargs):
+            ignored = batch['cls'].view(-1) == ignore_cls
+            if not ignored.any():
+                return assigned(self, preds, batch, **kwargs)
+            anchors, strides = tal.make_anchors(preds['feats'], self.stride, 0.5)
+            imgsz = torch.tensor(preds['feats'][0].shape[2:], device=self.device) * self.stride[0]  # h, w
+            xywh = batch['bboxes'][ignored].to(self.device) * imgsz[[1, 0, 1, 0]]
+            xywh[:, 2:] = xywh[:, 2:].clamp(min=self.assigner.stride_val)
+            points = (anchors * strides)[None]  # (1, anchors, 2) in input px
+            inside = ((points > xywh[:, None, :2] - xywh[:, None, 2:] / 2) &
+                      (points < xywh[:, None, :2] + xywh[:, None, 2:] / 2)).all(-1).float()  # (ignored, anchors)
+            covered = torch.zeros(preds['scores'].shape[0], inside.shape[1], device=self.device).index_add_(
+                0, batch['batch_idx'][ignored].long().to(self.device), inside) > 0  # (images, anchors)
+            bce = self.bce
+            self.bce = lambda p, t: bce(p, t) * ~(covered[..., None] & (t == 0).all(-1, keepdim=True))
+            kept = {**batch, **{k: batch[k][~ignored] for k in ('cls', 'bboxes', 'batch_idx')}}
+            try:
+                return assigned(self, preds, kept, **kwargs)
+            finally:
+                self.bce = bce
+        loss.v8DetectionLoss.get_assigned_targets_and_loss = without_ignored
 
 
 def callbacks(model, run_dir, args, process_start, counts):
@@ -133,6 +224,9 @@ def callbacks(model, run_dir, args, process_start, counts):
         if counts['parameters'] > MAX_PARAMETERS or counts['trainable'] > MAX_TRAINABLE:
             sys.exit(f'over the limits ({MAX_PARAMETERS / 1e6:.0f} M total, {MAX_TRAINABLE / 1e6:.0f} M trainable): '
                      'freeze more layers')
+        found = sum(int((lb['cls'] == IGNORE_CLASS).sum()) for lb in trainer.train_loader.dataset.labels)
+        if found != counts['ignored']:  # Ultralytics silently drops an image whose labels fail its checks
+            sys.exit(f'--ignore-dim: {found} ignored boxes in the train labels, {counts["ignored"]} written')
 
     def maybe_stop(trainer):
         now = time.time()
@@ -238,8 +332,19 @@ def main():
         model = YOLO(f'{args.model}.yaml').load(f'{plain}.pt') if args.model.endswith('-p2') else YOLO(f'{plain}.pt')
     counts = {}
     callbacks(model, run_dir, args, process_start, counts)
-    patch_losses(getattr(args, 'o2m_final', None), getattr(args, 'stal_min', None))  # runs before these flags: None
-    data_yaml = write_yolo_dataset(args.data)
+    ignore_dim = getattr(args, 'ignore_dim', [])  # runs before these flags: None / []
+    patch_losses(getattr(args, 'o2m_final', None), getattr(args, 'stal_min', None),
+                 IGNORE_CLASS if ignore_dim else None)
+    ignore = dim_boxes(args.data, ignore_dim) if ignore_dim else set()
+    counts['ignored'] = len(ignore)
+    data_yaml = write_yolo_dataset(args.data, ignore)
+    if class_scale := dict(getattr(args, 'class_scale', None) or {}):  # runs before the flag: no key
+        index = {name: int(i) for i, name in yaml.safe_load(data_yaml.read_text())['names'].items()}
+        default = class_scale.pop('default', 0.5)  # Ultralytics' scale
+        if unknown := set(class_scale) - set(index):
+            sys.exit(f'--class-scale: unknown classes {sorted(unknown)}')
+        patch_class_scale({index[name]: a for name, a in class_scale.items()}, default)
+        args.hyp = {**args.hyp, 'scale': 0.0}
     counts['train_start'] = time.time()
     common = dict(augmentations=albumentations(args), workers=args.workers)  # also taken on resume
     if args.resume:

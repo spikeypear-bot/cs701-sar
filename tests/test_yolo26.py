@@ -1,4 +1,4 @@
-"""yolo26.py's patches (--o2m-final, --stal-min, --ignore-dim, --class-scale) and --jpeg on Ultralytics' own classes; needs the cs701y26 env (8.4.189),
+"""yolo26.py's patches (--o2m-final, --stal-min, --ignore-dim, --class-scale, --cls-weights) and --jpeg on Ultralytics' own classes; needs the cs701y26 env (8.4.189),
 no GPU."""
 from types import SimpleNamespace
 
@@ -9,7 +9,7 @@ if not hasattr(loss, 'E2ELoss'):
     pytest.skip('needs the cs701y26 env (Ultralytics with YOLO26)', allow_module_level=True)
 from ultralytics.utils import tal
 
-from yolo26 import albumentations, patch_class_scale, patch_losses
+from yolo26 import albumentations, patch_class_scale, patch_losses, set_class_weights
 
 
 @pytest.fixture(autouse=True)
@@ -88,3 +88,14 @@ def test_class_scale_resizes_training_images_by_class():
 def test_jpeg_builds_with_the_installed_albumentations():
     transforms = albumentations(SimpleNamespace(mult_noise=0, gamma=0, brightness_contrast=0, jpeg=50, albu_p=0.5))
     assert len(transforms) == 1
+
+
+def test_cls_weights_set_on_the_trained_model():
+    import inspect
+    import torch
+    assert 'class_weights' in inspect.getsource(loss.v8DetectionLoss.__init__)  # the hook the loss reads
+    added = {}
+    set_class_weights(SimpleNamespace(add_callback=lambda event, f: added.setdefault(event, f)), [1.0, 2.0, 1.0])
+    trainer = SimpleNamespace(model=torch.nn.Linear(1, 1), device='cpu')
+    added['on_pretrain_routine_end'](trainer)
+    assert trainer.model.class_weights.tolist() == [1.0, 2.0, 1.0]

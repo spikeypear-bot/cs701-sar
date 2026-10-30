@@ -78,6 +78,9 @@ def parse_args():
                    help='train boxes of these classes (e.g. bridge,playground) with no bright return (brightest '
                         'pixel at most the image\'s 90th percentile; finding 21) give no loss: not a target, and the '
                         'anchors inside them are not trained as background either (default: none)')
+    p.add_argument('--cls-weights', type=parse_hyp, default={}, metavar='CLASS=W,...',
+                   help='weight of these classes\' columns in the box classification loss (BCE, both heads; '
+                        'Ultralytics\' class_weights), the rest 1, e.g. bridge=2,playground=2 (default: none)')
     p.add_argument('--name', help='run name; the run folder is <out>/<name>_<time> (needed for training)')
     p.add_argument('--out', type=Path, default=Path('runs'))
     p.add_argument('--stop-hours', type=float, help='see the description; train.slurm sets it')
@@ -211,6 +214,18 @@ def patch_losses(o2m_final=None, stal_min=None, ignore_cls=None):
         loss.v8DetectionLoss.get_assigned_targets_and_loss = without_ignored
 
 
+def set_class_weights(model, weights):
+    """--cls-weights: Ultralytics' own model.class_weights (v8DetectionLoss multiplies each class column of its BCE by
+    them), set at the end of the trainer's setup; the loss reads them when it is built, at the first training step."""
+    import torch
+    from ultralytics.utils.torch_utils import unwrap_model
+
+    def set_weights(trainer):
+        unwrap_model(trainer.model).class_weights = torch.tensor(weights, device=trainer.device)
+        print(f'--cls-weights: class weights {weights}', flush=True)
+    model.add_callback('on_pretrain_routine_end', set_weights)
+
+
 def callbacks(model, run_dir, args, process_start, counts):
     """Checks the trainable count once the trainer has frozen its layers (aborts over the limit), and --stop-hours
     after each saved epoch (weights/last.pt is written before on_model_save). counts['train_start'] (set before
@@ -338,8 +353,12 @@ def main():
     ignore = dim_boxes(args.data, ignore_dim) if ignore_dim else set()
     counts['ignored'] = len(ignore)
     data_yaml = write_yolo_dataset(args.data, ignore)
+    index = {name: int(i) for i, name in yaml.safe_load(data_yaml.read_text())['names'].items()}
+    if cls_weights := dict(getattr(args, 'cls_weights', None) or {}):  # runs before the flag: no key
+        if unknown := set(cls_weights) - set(index):
+            sys.exit(f'--cls-weights: unknown classes {sorted(unknown)}')
+        set_class_weights(model, [cls_weights.get(name, 1.0) for name in sorted(index, key=index.get)])
     if class_scale := dict(getattr(args, 'class_scale', None) or {}):  # runs before the flag: no key
-        index = {name: int(i) for i, name in yaml.safe_load(data_yaml.read_text())['names'].items()}
         default = class_scale.pop('default', 0.5)  # Ultralytics' scale
         if unknown := set(class_scale) - set(index):
             sys.exit(f'--class-scale: unknown classes {sorted(unknown)}')

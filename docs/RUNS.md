@@ -104,3 +104,5 @@ sbatch --cpus-per-task=4 --mem=32G --gres=gpu:l40s:1 train_personal.slurm --mode
 sbatch --cpus-per-task=4 --mem=32G --gres=gpu:l40s:1 train_personal.slurm --model yolo26x-p2 --freeze 5 6 7 8 --epochs 300 --scale 0.25 --class-scale ship=0.5,car=0.5,oil_tank=0.1,wind_turbine=0.1,harbor=0.1 --mosaic 0 --speckle --cls-head --full --postprocess-from runs_yolo/yolo26x-p2_freeze5-6-7-8_scale0_mosaic0_speckle_clshead_ep300
 # y26x-p2 e100 bridge / playground x2 in the box classification BCE (--cls-weights), vs y26x-p2-f5-8-scale025-nomosaic-e100
 sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp scale=0.25,mosaic=0 --cls-weights bridge=2,playground=2 --name y26x-p2-f5-8-scale025-nomosaic-clsw2-e100
+# y26x-p2 e100 ship-only BoxPaste (--paste 0.5 --paste-classes ship), vs y26x-p2-f5-8-scale025-nomosaic-e100
+sbatch --mem=64GB --time=1-00:00:00 train.slurm yolo26.py --freeze 5-8 --epochs 100 --mult-noise 0.1 --gamma 0.2 --brightness-contrast 0.2 --hyp scale=0.25,mosaic=0 --paste 0.5 --paste-classes ship --name y26x-p2-f5-8-scale025-nomosaic-pasteship-e100

@@ -81,6 +81,12 @@ def parse_args():
     p.add_argument('--cls-weights', type=parse_hyp, default={}, metavar='CLASS=W,...',
                    help='weight of these classes\' columns in the box classification loss (BCE, both heads; '
                         'Ultralytics\' class_weights), the rest 1, e.g. bridge=2,playground=2 (default: none)')
+    p.add_argument('--paste', type=float, default=0.0, metavar='P',
+                   help='chance that a training image of a --paste-classes class gets 1-4 same-class objects '
+                        '(sarbench BoxPaste, at the training scale, objects up to 96 px; default: 0 = off)')
+    p.add_argument('--paste-classes', type=lambda s: s.split(','), default=['ship'], metavar='CLASSES',
+                   help='--paste: the classes whose objects are copied (default: ship; groupmate\'s e300 runs: '
+                        'pasting every class helped ship, hurt oil tank / turbine / bridge / playground)')
     p.add_argument('--name', help='run name; the run folder is <out>/<name>_<time> (needed for training)')
     p.add_argument('--out', type=Path, default=Path('runs'))
     p.add_argument('--stop-hours', type=float, help='see the description; train.slurm sets it')
@@ -99,6 +105,8 @@ def parse_args():
         p.error('training needs --name')
     if args.class_scale and 'scale' in args.hyp:
         p.error('--class-scale replaces --hyp scale')
+    if args.paste and args.class_scale:
+        p.error('--paste expects Ultralytics\' own image sizes, which --class-scale changes')
     return args
 
 
@@ -139,6 +147,53 @@ def patch_class_scale(scales, default):
         im = cv2.resize(im, (max(1, round(hw[1] * s)), max(1, round(hw[0] * s))), interpolation=cv2.INTER_LINEAR)
         return im, hw0, im.shape[:2]
     BaseDataset.load_image = scaled
+
+
+def patch_paste(prob, classes, max_pastes=4, max_size=96):
+    """--paste: sarbench's same-class BoxPaste on Ultralytics' training images, at the training scale (long side
+    --imgsz) and before Mosaic: objects of `classes` (label indices) up to max_size px, from images of the same
+    original size, pasted into images of their class. Donors are read through the dataset's own load_image."""
+    import math
+    import numpy as np
+    from sarbench.data import BoxPaste
+    from ultralytics.data.dataset import YOLODataset
+    get = YOLODataset.get_image_and_label
+
+    def boxpaste(self):
+        items = []
+        for j, lb in enumerate(self.labels):
+            h0, w0 = lb['shape']
+            # shortcut: Ultralytics 8.4.189's load_image size (long side to imgsz), re-derived; a mismatch only
+            # empties the donor pool (no paste), so check the "--paste: N objects" line against the run's class count
+            r = self.imgsz / max(h0, w0)
+            h, w = (min(math.ceil(h0 * r), self.imgsz), min(math.ceil(w0 * r), self.imgsz)) if r != 1 else (h0, w0)
+            items += [(j, (h, w), int(c), [(x - bw / 2) * w, (y - bh / 2) * h, bw * w, bh * h])
+                      for (x, y, bw, bh), c in zip(lb['bboxes'], lb['cls'][:, 0]) if int(c) in classes]
+        paste = BoxPaste(items, prob, max_pastes, max_size,
+                         load=lambda j: self.load_image(j)[0][..., 0].astype(np.float32))
+        print(f'--paste: {sum(map(len, paste.pool.values()))} objects to copy', flush=True)
+        return paste
+
+    def pasted(self, index):
+        label = get(self, index)
+        if not self.augment or not len(label['cls']) or int(label['cls'][0, 0]) not in classes:
+            return label
+        if '_boxpaste' not in self.__dict__:
+            self._boxpaste = boxpaste(self)
+        img, instances = label['img'], label['instances']
+        h, w = img.shape[:2]
+        instances.convert_bbox('xyxy')
+        instances.denormalize(w, h)
+        xywh = [[x1, y1, x2 - x1, y2 - y1] for x1, y1, x2, y2 in instances.bboxes.tolist()]
+        gray, xywh = self._boxpaste(img[..., 0], xywh, int(label['cls'][0, 0]))
+        new = np.array([[x, y, x + bw, y + bh] for x, y, bw, bh in xywh[len(label['cls']):]], dtype=np.float32)
+        if len(new):
+            label['img'] = np.repeat(gray[..., None], img.shape[2], axis=2)  # the course images are grey
+            instances.update(np.concatenate([instances.bboxes, new]))
+            label['cls'] = np.concatenate([label['cls'], np.full((len(new), 1), label['cls'][0, 0],
+                                                                  dtype=label['cls'].dtype)])
+        return label
+    YOLODataset.get_image_and_label = pasted
 
 
 def dim_boxes(root, classes):
@@ -358,6 +413,10 @@ def main():
         if unknown := set(cls_weights) - set(index):
             sys.exit(f'--cls-weights: unknown classes {sorted(unknown)}')
         set_class_weights(model, [cls_weights.get(name, 1.0) for name in sorted(index, key=index.get)])
+    if getattr(args, 'paste', 0):  # runs before the flag: no key
+        if unknown := set(args.paste_classes) - set(index):
+            sys.exit(f'--paste-classes: unknown classes {sorted(unknown)}')
+        patch_paste(args.paste, {index[name] for name in args.paste_classes})
     if class_scale := dict(getattr(args, 'class_scale', None) or {}):  # runs before the flag: no key
         default = class_scale.pop('default', 0.5)  # Ultralytics' scale
         if unknown := set(class_scale) - set(index):

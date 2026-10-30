@@ -109,8 +109,10 @@ class BoxPaste:
     keeps its one class, so its classification label stays right. Each patch is scaled to the brightness of the spot
     it covers and its margin is blended in, so no hard seam gives it away."""
 
-    def __init__(self, items, prob, max_pastes, max_size, margin=3):
-        """items: (image path, (h, w), category id, [x, y, w, h]) of every box that may be copied."""
+    def __init__(self, items, prob, max_pastes, max_size, margin=3, load=None):
+        """items: (image path, (h, w), category id, [x, y, w, h]) of every box that may be copied. load: image path
+        (or whatever items name) -> float32 gray [H, W] in the boxes' pixels (default: the file, read as is)."""
+        self.load = load or (lambda path: np.asarray(Image.open(path).convert('L'), dtype=np.float32))
         self.pool = defaultdict(list)  # (category id, (h, w)) -> [(path, box)]: same size, so the same scale
         for path, size, category, box in items:
             if max(box[2], box[3]) <= max_size:
@@ -132,7 +134,7 @@ class BoxPaste:
             x1, y1 = int(np.ceil(bx + bw)) + m, int(np.ceil(by + bh)) + m
             if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
                 continue  # the margin would leave the donor image
-            patch = np.asarray(Image.open(path).convert('L'), dtype=np.float32)[y0:y1, x0:x1]
+            patch = self.load(path)[y0:y1, x0:x1]
             ph, pw = patch.shape
             for _ in range(10):  # a spot whose patch overlaps no box, pasted ones included
                 px, py = random.randint(0, width - pw), random.randint(0, height - ph)

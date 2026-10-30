@@ -1,4 +1,4 @@
-"""yolo26.py's patches (--o2m-final, --stal-min, --ignore-dim, --class-scale, --cls-weights) and --jpeg on Ultralytics' own classes; needs the cs701y26 env (8.4.189),
+"""yolo26.py's patches (--o2m-final, --stal-min, --ignore-dim, --class-scale, --cls-weights, --paste) and --jpeg on Ultralytics' own classes; needs the cs701y26 env (8.4.189),
 no GPU."""
 from types import SimpleNamespace
 
@@ -9,7 +9,7 @@ if not hasattr(loss, 'E2ELoss'):
     pytest.skip('needs the cs701y26 env (Ultralytics with YOLO26)', allow_module_level=True)
 from ultralytics.utils import tal
 
-from yolo26 import albumentations, patch_class_scale, patch_losses, set_class_weights
+from yolo26 import albumentations, patch_class_scale, patch_losses, patch_paste, set_class_weights
 
 
 @pytest.fixture(autouse=True)
@@ -99,3 +99,28 @@ def test_cls_weights_set_on_the_trained_model():
     trainer = SimpleNamespace(model=torch.nn.Linear(1, 1), device='cpu')
     added['on_pretrain_routine_end'](trainer)
     assert trainer.model.class_weights.tolist() == [1.0, 2.0, 1.0]
+
+
+def test_paste_adds_same_class_objects_only_to_listed_classes(monkeypatch):
+    import random
+    import numpy as np
+    from ultralytics.data.dataset import YOLODataset
+    from ultralytics.utils.instance import Instances
+
+    image = np.zeros((64, 64, 3), np.uint8)
+    image[28:36, 28:36] = 200  # an 8 px object in the middle
+    box = np.array([[0.5, 0.5, 0.125, 0.125]], np.float32)  # normalised centre xywh
+
+    def stub(self, index):
+        return {'img': image.copy(), 'cls': np.array([[self.labels[index]['cls'][0, 0]]], np.float32),
+                'instances': Instances(box.copy(), bbox_format='xywh', normalized=True)}
+    monkeypatch.setattr(YOLODataset, 'get_image_and_label', stub)
+    patch_paste(1.0, {7})
+    labels = [{'shape': (64, 64), 'bboxes': box, 'cls': np.array([[c]], np.float32)} for c in (7, 7, 2)]
+    dataset = SimpleNamespace(augment=True, imgsz=64, labels=labels,
+                              load_image=lambda j: (image.copy(), (64, 64), (64, 64)))
+    random.seed(0)
+    label = YOLODataset.get_image_and_label(dataset, 0)
+    assert len(label['cls']) == len(label['instances']) > 1 and (label['cls'] == 7).all()
+    assert label['img'].shape == image.shape and (label['img'] > 100).sum() > (image > 100).sum()
+    assert len(YOLODataset.get_image_and_label(dataset, 2)['cls']) == 1  # class 2 is not in the list
